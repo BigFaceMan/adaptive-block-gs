@@ -26,7 +26,9 @@ class Camera(nn.Module):
 
         self.uid = uid
         self.colmap_id = colmap_id
+        # Rc2w
         self.R = R
+        # tw2c
         self.T = T
         self.FoVx = FoVx
         self.FoVy = FoVy
@@ -53,7 +55,7 @@ class Camera(nn.Module):
             else:
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
-        self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        self.original_image = gt_image.clamp(0.0, 1.0)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 

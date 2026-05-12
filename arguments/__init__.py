@@ -69,6 +69,11 @@ class PipelineParams(ParamGroup):
         self.compute_cov3D_python = False
         self.debug = False
         self.antialiasing = False
+        self.swanlab_experiment_name = "mc-aerial-baseline"
+        self.swanlab_project = "block-gs"
+        self.swanlab_workspace = ""
+        self.swanlab_mode = "cloud"
+        self.swanlab_logdir = ""
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
