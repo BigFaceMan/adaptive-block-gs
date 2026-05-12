@@ -3,13 +3,23 @@ set -euo pipefail
 
 TRAIN_DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all"
 TEST_DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/test/block_all_test"
-OUTPUT_PATH="/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_block_all_30000"
-CUDA_ID=5
+BASE_OUTPUT_PATH="/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_block_all_30000"
+OUTPUT_PATH="${OUTPUT_PATH-/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_block_all_30000_lowmem}"
+CUDA_ID="${CUDA_ID-5}"
 ITERATIONS=30000
-SWANLAB_EXP_NAME="mc_aerial_block_all_30000-baseline"
-START_CHECKPOINT="${START_CHECKPOINT-$OUTPUT_PATH/chkpnt7000.pth}"
+SWANLAB_EXP_NAME="${SWANLAB_EXP_NAME-mc_aerial_block_all_30000-lowmem}"
+START_CHECKPOINT="${START_CHECKPOINT-$BASE_OUTPUT_PATH/chkpnt7000.pth}"
 CAMERA_LOAD_WORKERS="${CAMERA_LOAD_WORKERS-8}"
 DATA_DEVICE="${DATA_DEVICE-cpu}"
+
+# Lower-memory densification schedule. The original run OOMed around 13.9k,
+# so this stops adding points earlier and makes each densify step more selective.
+DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER-9000}"
+DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL-300}"
+DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD-0.001}"
+TEST_ITERATIONS="${TEST_ITERATIONS--1}"
+
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF-max_split_size_mb:128}"
 
 MODEL_DIR="$OUTPUT_PATH/point_cloud/iteration_${ITERATIONS}"
 TRAIN_RENDER_DIR="$OUTPUT_PATH/train/ours_${ITERATIONS}/renders"
@@ -17,15 +27,18 @@ TEST_RENDER_DIR="$OUTPUT_PATH/test/ours_${ITERATIONS}/renders"
 
 train_model() {
     local train_args=(
-        -s "$TRAIN_DATA_PATH" \
-        --images input \
-        -m "$OUTPUT_PATH" \
-        --iterations "$ITERATIONS" \
-        --test_iterations 7000 "$ITERATIONS" \
-        --save_iterations 7000 "$ITERATIONS" \
-        --checkpoint_iterations 7000 "$ITERATIONS" \
-        --camera_load_workers "$CAMERA_LOAD_WORKERS" \
-        --data_device "$DATA_DEVICE" \
+        -s "$TRAIN_DATA_PATH"
+        --images input
+        -m "$OUTPUT_PATH"
+        --iterations "$ITERATIONS"
+        --test_iterations "$TEST_ITERATIONS"
+        --save_iterations 7000 9000 12000 15000 "$ITERATIONS"
+        --checkpoint_iterations 7000 9000 12000 15000 "$ITERATIONS"
+        --densify_until_iter "$DENSIFY_UNTIL_ITER"
+        --densification_interval "$DENSIFICATION_INTERVAL"
+        --densify_grad_threshold "$DENSIFY_GRAD_THRESHOLD"
+        --camera_load_workers "$CAMERA_LOAD_WORKERS"
+        --data_device "$DATA_DEVICE"
         --swanlab_experiment_name "$SWANLAB_EXP_NAME"
     )
 
@@ -37,6 +50,15 @@ train_model() {
         echo "Resuming training from checkpoint: $START_CHECKPOINT"
         train_args+=(--start_checkpoint "$START_CHECKPOINT")
     fi
+
+    echo "Low-memory densification:"
+    echo "  densify_until_iter=$DENSIFY_UNTIL_ITER"
+    echo "  densification_interval=$DENSIFICATION_INTERVAL"
+    echo "  densify_grad_threshold=$DENSIFY_GRAD_THRESHOLD"
+    echo "  test_iterations=$TEST_ITERATIONS"
+    echo "  camera_load_workers=$CAMERA_LOAD_WORKERS"
+    echo "  data_device=$DATA_DEVICE"
+    echo "  output_path=$OUTPUT_PATH"
 
     CUDA_VISIBLE_DEVICES=$CUDA_ID python train.py "${train_args[@]}"
 }

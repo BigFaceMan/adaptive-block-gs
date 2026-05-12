@@ -3,12 +3,12 @@ set -euo pipefail
 
 TRAIN_DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all"
 TEST_DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/test/block_all_test"
-OUTPUT_PATH="/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_block_all_30000"
+OUTPUT_PATH="/lfs1/users/spsong/Code/project/gaussian-splatting/output/test_load"
 CUDA_ID=5
 ITERATIONS=30000
-SWANLAB_EXP_NAME="mc_aerial_block_all_30000-baseline"
+SWANLAB_EXP_NAME="test_load"
 START_CHECKPOINT="${START_CHECKPOINT-$OUTPUT_PATH/chkpnt7000.pth}"
-CAMERA_LOAD_WORKERS="${CAMERA_LOAD_WORKERS-8}"
+CAMERA_LOAD_WORKERS="${CAMERA_LOAD_WORKERS-16}"
 DATA_DEVICE="${DATA_DEVICE-cpu}"
 
 MODEL_DIR="$OUTPUT_PATH/point_cloud/iteration_${ITERATIONS}"
@@ -23,11 +23,14 @@ train_model() {
         --iterations "$ITERATIONS" \
         --test_iterations 7000 "$ITERATIONS" \
         --save_iterations 7000 "$ITERATIONS" \
-        --checkpoint_iterations 7000 "$ITERATIONS" \
         --camera_load_workers "$CAMERA_LOAD_WORKERS" \
         --data_device "$DATA_DEVICE" \
         --swanlab_experiment_name "$SWANLAB_EXP_NAME"
     )
+
+    echo "Camera loading:"
+    echo "  camera_load_workers=$CAMERA_LOAD_WORKERS"
+    echo "  data_device=$DATA_DEVICE"
 
     if [ -n "$START_CHECKPOINT" ]; then
         if [ ! -f "$START_CHECKPOINT" ]; then

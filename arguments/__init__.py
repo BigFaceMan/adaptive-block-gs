@@ -55,6 +55,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.train_test_exp = False
         self.data_device = "cuda"
+        self.camera_load_workers = 0
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 

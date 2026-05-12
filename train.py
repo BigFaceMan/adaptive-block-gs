@@ -198,7 +198,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress_bar.close()
 
                 # Log and save
-                training_report(logger, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+                training_report(logger, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp)
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
@@ -211,7 +211,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                        points_before = gaussians.get_xyz.shape[0]
+                        allocated_before = torch.cuda.memory_allocated()
+                        reserved_before = torch.cuda.memory_reserved()
+                        try:
+                            gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                        except RuntimeError as exc:
+                            if "out of memory" in str(exc).lower():
+                                print(
+                                    "\n[OOM during densify] "
+                                    f"iteration={iteration}, "
+                                    f"points_before={points_before}, "
+                                    f"allocated_before={allocated_before / 1024**3:.2f}GB, "
+                                    f"reserved_before={reserved_before / 1024**3:.2f}GB, "
+                                    f"allocated_now={torch.cuda.memory_allocated() / 1024**3:.2f}GB, "
+                                    f"reserved_now={torch.cuda.memory_reserved() / 1024**3:.2f}GB"
+                                )
+                                if logger:
+                                    try:
+                                        logger.add_scalar("oom/iteration", iteration, iteration)
+                                        logger.add_scalar("oom/points_before_densify", points_before, iteration)
+                                        logger.add_scalar("oom/memory_allocated_gb", torch.cuda.memory_allocated() / 1024**3, iteration)
+                                        logger.add_scalar("oom/memory_reserved_gb", torch.cuda.memory_reserved() / 1024**3, iteration)
+                                    except Exception as log_exc:
+                                        print(f"[OOM logging failed] {log_exc}")
+                            raise
+                        points_after = gaussians.get_xyz.shape[0]
+                        points_delta = points_after - points_before
+                        print(f"\n[DENSIFY] iteration={iteration}, points {points_before} -> {points_after}")
+                        if logger:
+                            logger.add_scalar("densify/points_before", points_before, iteration)
+                            logger.add_scalar("densify/points_after", points_after, iteration)
+                            logger.add_scalar("densify/points_delta", points_delta, iteration)
 
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians.reset_opacity()
@@ -270,11 +301,36 @@ def prepare_output_and_logger(args):
         print("SwanLab not available: not logging progress")
     return logger
 
-def training_report(logger, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def log_training_observations(logger, iteration, gaussians, radii, visibility_filter):
+    if not logger:
+        return
+
+    total_points = gaussians.get_xyz.shape[0]
+    visible_points = int(visibility_filter.sum().item())
+    logger.add_scalar("scene/total_points", total_points, iteration)
+    logger.add_scalar("scene/visible_points", visible_points, iteration)
+    logger.add_scalar("scene/visibility_ratio", visible_points / max(total_points, 1), iteration)
+
+    if visible_points > 0:
+        visible_radii = radii[visibility_filter]
+        logger.add_scalar("scene/visible_radii_mean", visible_radii.float().mean().item(), iteration)
+        logger.add_scalar("scene/visible_radii_max", visible_radii.float().max().item(), iteration)
+
+    if torch.cuda.is_available():
+        logger.add_scalar("gpu/memory_allocated_gb", torch.cuda.memory_allocated() / 1024**3, iteration)
+        logger.add_scalar("gpu/memory_reserved_gb", torch.cuda.memory_reserved() / 1024**3, iteration)
+        logger.add_scalar("gpu/max_memory_allocated_gb", torch.cuda.max_memory_allocated() / 1024**3, iteration)
+
+    for group in gaussians.optimizer.param_groups:
+        group_name = group.get("name", "unknown")
+        logger.add_scalar(f"optimizer/lr_{group_name}", group["lr"], iteration)
+
+def training_report(logger, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp):
     if logger and iteration % 10 == 0:
         logger.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         logger.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         logger.add_scalar('iter_time', elapsed, iteration)
+        log_training_observations(logger, iteration, scene.gaussians, radii, visibility_filter)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
