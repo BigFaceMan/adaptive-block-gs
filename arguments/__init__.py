@@ -51,17 +51,41 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        self.test_source_path = ""
+        self.test_images = ""
+        self.test_depths = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
-        self.data_device = "cuda"
+        self.data_device = "cpu"
         self.camera_load_workers = 0
+        self.lazy_load_images = False
+        self.image_load_mode = "dataloader"
+        self.image_loader_seed = 42
+        self.max_cache_num = 128
+        self.image_cache_workers = 0
+        self.partition_path = ""
+        self.block_id = ""
+        self.partition_bbox_mode = "expanded"
+        self.partition_init_mode = "cropped"
+        self.partition_load_test_cameras = False
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        if getattr(g, "test_source_path", ""):
+            g.test_source_path = os.path.abspath(g.test_source_path)
+        image_load_mode = getattr(g, "image_load_mode", "dataloader") or "dataloader"
+        if image_load_mode in {"preload", "lazy"}:
+            print(f"[DataLoader] Deprecated image_load_mode={image_load_mode}; using dataloader path")
+            image_load_mode = "dataloader"
+        if getattr(g, "lazy_load_images", False):
+            print("[DataLoader] Deprecated --lazy_load_images ignored; use --max_cache_num 0 for on-demand loading")
+        if image_load_mode not in {"dataloader", "cache"}:
+            raise ValueError("--image_load_mode must be one of: dataloader, cache")
+        g.image_load_mode = image_load_mode
         return g
 
 class PipelineParams(ParamGroup):

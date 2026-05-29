@@ -146,6 +146,17 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def initialize_exposure(self, cam_infos):
+        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
+        self.pretrained_exposures = None
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+    def prepare_loaded_ply_for_training(self, cam_infos, spatial_lr_scale: float):
+        self.spatial_lr_scale = spatial_lr_scale
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.initialize_exposure(cam_infos)
+
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -170,10 +181,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
-        self.pretrained_exposures = None
-        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
-        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+        self.initialize_exposure(cam_infos)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -236,16 +244,30 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, mask=None):
         mkdir_p(os.path.dirname(path))
 
+        if mask is not None:
+            if isinstance(mask, torch.Tensor):
+                mask = mask.detach().bool().cpu().numpy()
+            else:
+                mask = np.asarray(mask, dtype=bool)
+
         xyz = self._xyz.detach().cpu().numpy()
+        if mask is not None:
+            xyz = xyz[mask]
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        if mask is not None:
+            f_dc = f_dc[mask]
+            f_rest = f_rest[mask]
+            opacities = opacities[mask]
+            scale = scale[mask]
+            rotation = rotation[mask]
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 

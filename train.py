@@ -11,12 +11,19 @@
 
 import os
 import torch
-from random import randint
+import time
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.datasets import CameraDataLoader, GSCameraDataset
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.config_utils import (
+    load_yaml_config,
+    namespace_from_config,
+    save_yaml_config,
+    stage_args_from_config,
+)
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -83,6 +90,21 @@ class SwanLabLogger:
         if self.enabled:
             swanlab.finish()
 
+
+def make_validation_dataset(scene, dataset_args, camera_infos, is_test_dataset, indices=None):
+    if not camera_infos:
+        return []
+    if indices is not None:
+        camera_infos = [camera_infos[idx] for idx in indices]
+    camera_dataset = GSCameraDataset(
+        camera_infos,
+        dataset_args,
+        scene.is_nerf_synthetic,
+        is_test_dataset=is_test_dataset,
+    )
+    return camera_dataset
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -105,10 +127,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
-    viewpoint_indices = list(range(len(viewpoint_stack)))
+    max_cache_num = int(getattr(dataset, "max_cache_num", 0))
+    release_viewpoint_after_iter = max_cache_num == 0
+    train_dataset = GSCameraDataset(
+        scene.getTrainCameraInfos(),
+        dataset,
+        scene.is_nerf_synthetic,
+        is_test_dataset=False,
+    )
+    if len(train_dataset) == 0:
+        raise RuntimeError("No training cameras found")
+    print(
+        "[DataLoader] "
+        f"train_cameras={len(train_dataset)}, "
+        f"max_cache_num={max_cache_num}, "
+        f"cache_workers={getattr(dataset, 'image_cache_workers', 0)}"
+    )
+    camera_loader = CameraDataLoader(
+        train_dataset,
+        batch_size=1,
+        max_cache_num=max_cache_num,
+        cache_workers=getattr(dataset, "image_cache_workers", 0),
+        shuffle=True,
+        seed=getattr(dataset, "image_loader_seed", 42),
+        num_workers=0,
+    )
+    camera_loader_iter = iter(camera_loader)
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_time_render = 0.0
+    ema_time_loss = 0.0
+    ema_time_densify = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -138,12 +187,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.oneupSHdegree()
 
             # Pick a random Camera
-            if not viewpoint_stack:
-                viewpoint_stack = scene.getTrainCameras().copy()
-                viewpoint_indices = list(range(len(viewpoint_stack)))
-            rand_idx = randint(0, len(viewpoint_indices) - 1)
-            viewpoint_cam = viewpoint_stack.pop(rand_idx)
-            vind = viewpoint_indices.pop(rand_idx)
+            try:
+                viewpoint_cam = next(camera_loader_iter)
+            except StopIteration:
+                camera_loader_iter = iter(camera_loader)
+                viewpoint_cam = next(camera_loader_iter)
 
             # Render
             if (iteration - 1) == debug_from:
@@ -151,9 +199,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+            start = time.time()
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            end = time.time()
+            ema_time_render = 0.4 * (end - start) + 0.6 * ema_time_render
 
+            start = time.time()
             if viewpoint_cam.alpha_mask is not None:
                 alpha_mask = viewpoint_cam.alpha_mask.cuda()
                 image *= alpha_mask
@@ -183,6 +235,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 Ll1depth = 0
 
             loss.backward()
+            end = time.time()
+            ema_time_loss = 0.4 * (end - start) + 0.6 * ema_time_loss
 
             iter_end.record()
 
@@ -197,8 +251,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration == opt.iterations:
                     progress_bar.close()
 
+                grads = gaussians.xyz_gradient_accum / gaussians.denom
+                grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
+                ema_time = {
+                    "render": ema_time_render,
+                    "loss": ema_time_loss,
+                    "densify": ema_time_densify,
+                    "num_points": radii.shape[0],
+                    "mean_grad": grads.mean().item() if grads.numel() > 0 else 0.0,
+                }
+
                 # Log and save
-                training_report(logger, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp)
+                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset)
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
@@ -215,7 +279,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         allocated_before = torch.cuda.memory_allocated()
                         reserved_before = torch.cuda.memory_reserved()
                         try:
+                            start = time.time()
                             gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                            end = time.time()
+                            ema_time_densify = 0.4 * (end - start) + 0.6 * ema_time_densify
                         except RuntimeError as exc:
                             if "out of memory" in str(exc).lower():
                                 print(
@@ -262,7 +329,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if (iteration in checkpoint_iterations):
                     print("\n[ITER {}] Saving Checkpoint".format(iteration))
                     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if release_viewpoint_after_iter:
+                    viewpoint_cam.release_image()
     finally:
+        if hasattr(camera_loader_iter, "close"):
+            camera_loader_iter.close()
         progress_bar.close()
         logger.close()
 
@@ -277,8 +348,13 @@ def prepare_output_and_logger(args):
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
+    resolved_config = getattr(args, "resolved_config", None)
+    if resolved_config:
+        save_yaml_config(os.path.join(args.model_path, "resolved_config.yaml"), resolved_config)
+    cfg_args = vars(args).copy()
+    cfg_args.pop("resolved_config", None)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        cfg_log_f.write(str(Namespace(**cfg_args)))
 
     # Create SwanLab logger
     logger = SwanLabLogger(enabled=SWANLAB_FOUND)
@@ -291,7 +367,7 @@ def prepare_output_and_logger(args):
                 workspace=args.swanlab_workspace or None,
                 experiment_name=args.swanlab_experiment_name or None,
                 mode=args.swanlab_mode or None,
-                config=vars(args),
+                config=cfg_args,
                 logdir=logdir,
             )
         except Exception as exc:
@@ -325,35 +401,53 @@ def log_training_observations(logger, iteration, gaussians, radii, visibility_fi
         group_name = group.get("name", "unknown")
         logger.add_scalar(f"optimizer/lr_{group_name}", group["lr"], iteration)
 
-def training_report(logger, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp):
+def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None):
     if logger and iteration % 10 == 0:
         logger.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         logger.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        logger.add_scalar('train_time/render', ema_time["render"], iteration)
+        logger.add_scalar('train_time/loss', ema_time["loss"], iteration)
+        logger.add_scalar('train_time/densify', ema_time["densify"], iteration)
+        logger.add_scalar('train_time/num_points', ema_time["num_points"], iteration)
+        logger.add_scalar('train_time/mean_grad', ema_time["mean_grad"], iteration)
         logger.add_scalar('iter_time', elapsed, iteration)
         log_training_observations(logger, iteration, scene.gaussians, radii, visibility_filter)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        train_infos = scene.getTrainCameraInfos()
+        train_indices = [idx % len(train_infos) for idx in range(5, 30, 5)] if train_infos else []
+        validation_configs = (
+            {
+                'name': 'test',
+                'cameras': make_validation_dataset(scene, dataset_args, scene.getTestCameraInfos(), True),
+            },
+            {
+                'name': 'train',
+                'cameras': make_validation_dataset(scene, dataset_args, train_infos, False, train_indices),
+            },
+        )
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if logger and (idx < 5):
-                        logger.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            logger.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    try:
+                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        if train_test_exp:
+                            image = image[..., image.shape[-1] // 2:]
+                            gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        if logger and (idx < 5):
+                            logger.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                            if iteration == testing_iterations[0]:
+                                logger.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        l1_test += l1_loss(image, gt_image).mean().double()
+                        psnr_test += psnr(image, gt_image).mean().double()
+                    finally:
+                        viewpoint.release_image()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
@@ -372,6 +466,8 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    parser.add_argument("--config", type=str, default="")
+    parser.add_argument("--override", action="append", default=[])
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -382,7 +478,16 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    args = parser.parse_args(sys.argv[1:])
+    cli_args = parser.parse_args(sys.argv[1:])
+    args = cli_args
+    if cli_args.config:
+        defaults = parser.parse_args([])
+        cfg = load_yaml_config(cli_args.config, cli_args.override)
+        cfg_args = stage_args_from_config(cfg, "train", block_id=cli_args.block_id or None)
+        cfg_args["config"] = os.path.abspath(cli_args.config)
+        args = namespace_from_config(defaults, cfg_args, resolved_config=cfg)
+    if not isinstance(args.save_iterations, list):
+        args.save_iterations = list(args.save_iterations)
     args.save_iterations.append(args.iterations)
 
     logger = prepare_output_and_logger(args)
