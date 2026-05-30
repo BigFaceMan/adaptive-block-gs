@@ -160,6 +160,7 @@ def render_args(cfg: ExperimentConfig):
             "iteration": cfg.render.iteration,
             "skip_train": cfg.render.skip_train,
             "skip_test": cfg.render.skip_test,
+            "render_depth": cfg.render.render_depth,
             "quiet": cfg.render.quiet,
         }
     )

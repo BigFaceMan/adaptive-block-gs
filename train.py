@@ -105,6 +105,75 @@ def make_validation_dataset(scene, dataset_args, camera_infos, is_test_dataset, 
     return camera_dataset
 
 
+def depth_tensor_to_image(depth, mask=None):
+    if depth is None:
+        return None
+    depth = depth.detach().float()
+    while depth.ndim > 3:
+        depth = depth[0]
+    if depth.ndim == 2:
+        depth = depth.unsqueeze(0)
+    if depth.ndim != 3:
+        return None
+    if depth.shape[0] != 1:
+        depth = depth[:1]
+
+    valid = torch.isfinite(depth)
+    if mask is not None:
+        mask = mask.detach().to(device=depth.device).float()
+        while mask.ndim > 3:
+            mask = mask[0]
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim == 3 and mask.shape[0] != 1:
+            mask = mask[:1]
+        if mask.shape == depth.shape:
+            valid = valid & (mask > 0)
+
+    if not bool(valid.any().item()):
+        return torch.zeros((3, depth.shape[-2], depth.shape[-1]), device=depth.device, dtype=depth.dtype)
+
+    values = depth[valid]
+    min_value = values.min()
+    max_value = values.max()
+    value_range = max_value - min_value
+    if not bool(torch.isfinite(value_range).item()) or float(value_range.abs().item()) < 1e-8:
+        return torch.zeros((3, depth.shape[-2], depth.shape[-1]), device=depth.device, dtype=depth.dtype)
+
+    image = ((depth - min_value) / value_range).clamp(0.0, 1.0)
+    image = torch.nan_to_num(image, nan=0.0, posinf=1.0, neginf=0.0)
+    image[~valid] = 0.0
+    return image.expand(3, -1, -1).contiguous()
+
+
+def log_validation_depth_images(logger, tag_prefix, iteration, render_pkg, viewpoint, log_gt_depth):
+    rendered_invdepth = render_pkg.get("depth")
+    if rendered_invdepth is None:
+        return
+
+    rendered_vis = depth_tensor_to_image(rendered_invdepth)
+    if rendered_vis is not None:
+        logger.add_images(f"{tag_prefix}/render_inv_depth", rendered_vis[None], global_step=iteration)
+
+    if not getattr(viewpoint, "depth_reliable", False) or viewpoint.invdepthmap is None:
+        return
+
+    gt_invdepth = viewpoint.invdepthmap.to(rendered_invdepth.device)
+    depth_mask = viewpoint.depth_mask.to(rendered_invdepth.device) if viewpoint.depth_mask is not None else None
+
+    if log_gt_depth:
+        gt_vis = depth_tensor_to_image(gt_invdepth, depth_mask)
+        if gt_vis is not None:
+            logger.add_images(f"{tag_prefix}/gt_inv_depth", gt_vis[None], global_step=iteration)
+
+    invdepth_error = torch.abs(rendered_invdepth.detach() - gt_invdepth)
+    if depth_mask is not None:
+        invdepth_error = invdepth_error * depth_mask
+    error_vis = depth_tensor_to_image(invdepth_error, depth_mask)
+    if error_vis is not None:
+        logger.add_images(f"{tag_prefix}/inv_depth_error", error_vis[None], global_step=iteration)
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -221,18 +290,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
             # Depth regularization
-            Ll1depth_pure = 0.0
-            if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+            depth_weight_value = depth_l1_weight(iteration)
+            depth_reg_enabled = bool(getattr(dataset, "depths", "")) and depth_weight_value > 0
+            depth_reliable = bool(getattr(viewpoint_cam, "depth_reliable", False))
+            Ll1depth_pure_item = 0.0
+            if depth_weight_value > 0 and depth_reliable:
                 invDepth = render_pkg["depth"]
                 mono_invdepth = viewpoint_cam.invdepthmap.cuda()
                 depth_mask = viewpoint_cam.depth_mask.cuda()
 
                 Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-                Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure
+                Ll1depth = depth_weight_value * Ll1depth_pure
                 loss += Ll1depth
+                Ll1depth_pure_item = Ll1depth_pure.item()
                 Ll1depth = Ll1depth.item()
             else:
                 Ll1depth = 0
+            depth_stats = {
+                "enabled": depth_reg_enabled,
+                "applied": depth_reg_enabled and depth_reliable,
+                "reliable": depth_reliable,
+                "l1_loss": Ll1depth,
+                "l1_loss_pure": Ll1depth_pure_item,
+                "weight": depth_weight_value,
+            }
 
             loss.backward()
             end = time.time()
@@ -262,7 +343,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 }
 
                 # Log and save
-                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset)
+                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset, depth_stats)
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
@@ -401,10 +482,16 @@ def log_training_observations(logger, iteration, gaussians, radii, visibility_fi
         group_name = group.get("name", "unknown")
         logger.add_scalar(f"optimizer/lr_{group_name}", group["lr"], iteration)
 
-def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None):
+def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None):
     if logger and iteration % 10 == 0:
         logger.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         logger.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        if depth_stats and depth_stats.get("enabled", False):
+            logger.add_scalar('train_loss_patches/depth_l1_loss', depth_stats["l1_loss"], iteration)
+            logger.add_scalar('train_loss_patches/depth_l1_loss_pure', depth_stats["l1_loss_pure"], iteration)
+            logger.add_scalar('train_loss_patches/depth_l1_weight', depth_stats["weight"], iteration)
+            logger.add_scalar('train_loss_patches/depth_reliable', float(depth_stats["reliable"]), iteration)
+            logger.add_scalar('train_loss_patches/depth_applied', float(depth_stats["applied"]), iteration)
         logger.add_scalar('train_time/render', ema_time["render"], iteration)
         logger.add_scalar('train_time/loss', ema_time["loss"], iteration)
         logger.add_scalar('train_time/densify', ema_time["densify"], iteration)
@@ -416,6 +503,7 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
+        log_depth_images = bool(getattr(dataset_args, "depths", "") or getattr(dataset_args, "test_depths", ""))
         train_infos = scene.getTrainCameraInfos()
         train_indices = [idx % len(train_infos) for idx in range(5, 30, 5)] if train_infos else []
         validation_configs = (
@@ -435,15 +523,26 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     try:
-                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                        render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                        image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                         if train_test_exp:
                             image = image[..., image.shape[-1] // 2:]
                             gt_image = gt_image[..., gt_image.shape[-1] // 2:]
                         if logger and (idx < 5):
-                            logger.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                            tag_prefix = config['name'] + "_view_{}".format(viewpoint.image_name)
+                            logger.add_images(tag_prefix + "/render", image[None], global_step=iteration)
+                            if log_depth_images:
+                                log_validation_depth_images(
+                                    logger,
+                                    tag_prefix,
+                                    iteration,
+                                    render_pkg,
+                                    viewpoint,
+                                    iteration == testing_iterations[0],
+                                )
                             if iteration == testing_iterations[0]:
-                                logger.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                                logger.add_images(tag_prefix + "/ground_truth", gt_image[None], global_step=iteration)
                         l1_test += l1_loss(image, gt_image).mean().double()
                         psnr_test += psnr(image, gt_image).mean().double()
                     finally:

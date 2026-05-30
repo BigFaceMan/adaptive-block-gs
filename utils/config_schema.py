@@ -250,6 +250,7 @@ def get_default_render_params():
         iteration=-1,
         skip_train=False,
         skip_test=False,
+        render_depth=False,
         quiet=False,
     )
 
