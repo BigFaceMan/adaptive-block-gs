@@ -62,6 +62,7 @@ def get_default_config():
     cfg.visualization = get_default_visualization_params()
     cfg.block_training = get_default_block_training_params()
     cfg.merge = get_default_merge_params()
+    cfg.post_train = get_default_post_train_params()
     cfg.render = get_default_render_params()
     cfg.metrics = get_default_metrics_params()
     cfg.config_path = ""
@@ -238,6 +239,25 @@ def get_default_merge_params():
         output_path="",
         allow_missing=False,
         cfg_args_source="",
+    )
+
+
+def get_default_post_train_params():
+    return make_group(
+        input_model_path="",
+        input_iteration=30000,
+        output_path="",
+        partition_path="",
+        merge_report_path="",
+        boundary_band_ratio=0.05,
+        boundary_axes=["x", "y"],
+        boundary_geom_grad_scale=1.0,
+        internal_color_grad_scale=1.0,
+        internal_opacity_grad_scale=1.0,
+        iterations=5000,
+        save_iterations=[5000],
+        checkpoint_iterations=[],
+        test_iterations=[-1],
     )
 
 

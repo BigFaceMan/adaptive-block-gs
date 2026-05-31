@@ -41,6 +41,8 @@ def stage_args_from_config(config, stage, block_id=None):
         return train_args(cfg, block_id=block_id)
     if stage == "merge":
         return merge_args(cfg)
+    if stage == "post_train":
+        return post_train_args(cfg)
     if stage == "render":
         return render_args(cfg)
     if stage == "metrics":
@@ -145,6 +147,25 @@ def merge_args(cfg: ExperimentConfig):
         "allow_missing": cfg.merge.allow_missing,
         "cfg_args_source": cfg.merge.cfg_args_source,
     }
+
+
+def post_train_args(cfg: ExperimentConfig):
+    cfg = _ensure_config(cfg)
+    args = common_dataset_args(cfg)
+    args.update(common_pipeline_args(cfg))
+    args.update(vars(cfg.optimization))
+    args.update(vars(cfg.training))
+    args.update(vars(cfg.post_train))
+
+    output_path = cfg.post_train.output_path or os.path.join(cfg.output_root, "post_train")
+    args["model_path"] = output_path
+    args["output_path"] = output_path
+    args["iterations"] = cfg.post_train.iterations
+    args["save_iterations"] = cfg.post_train.save_iterations
+    args["checkpoint_iterations"] = cfg.post_train.checkpoint_iterations
+    args["test_iterations"] = cfg.post_train.test_iterations
+    args["swanlab_experiment_name"] = args.get("swanlab_experiment_name") or f"{cfg.logging.swanlab_experiment_prefix}-post"
+    return args
 
 
 def render_args(cfg: ExperimentConfig):
