@@ -17,6 +17,7 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from scene.datasets import CameraDataLoader, GSCameraDataset
+from utils.block_depth_mask import BlockDepthMasker
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.config_utils import (
     load_yaml_config,
@@ -195,6 +196,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    depth_mask_mode = getattr(opt, "depth_reg_mask_mode", "full") or "full"
+    if depth_mask_mode not in {"full", "block_projection"}:
+        raise ValueError("--depth_reg_mask_mode must be 'full' or 'block_projection'")
+    block_depth_masker = None
+    if depth_mask_mode == "block_projection":
+        if scene.block_metadata is None:
+            raise ValueError("depth_reg_mask_mode=block_projection requires block training")
+        block_depth_masker = BlockDepthMasker(
+            scene.block_metadata,
+            bbox_mode=getattr(opt, "depth_reg_mask_bbox_mode", "expanded"),
+            max_points=getattr(opt, "depth_reg_mask_max_points", 100000),
+            dilate_px=getattr(opt, "depth_reg_mask_dilate_px", 16),
+        )
 
     max_cache_num = int(getattr(dataset, "max_cache_num", 0))
     release_viewpoint_after_iter = max_cache_num == 0
@@ -294,25 +308,60 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             depth_reg_enabled = bool(getattr(dataset, "depths", "")) and depth_weight_value > 0
             depth_reliable = bool(getattr(viewpoint_cam, "depth_reliable", False))
             Ll1depth_pure_item = 0.0
+            depth_mask_pixels = 0.0
+            depth_mask_coverage = 0.0
+            depth_mask_enough = True
+            depth_reg_time = 0.0
+            depth_mask_project_time = 0.0
+            depth_mask_transfer_time = 0.0
+            depth_reg_start = time.time()
             if depth_weight_value > 0 and depth_reliable:
                 invDepth = render_pkg["depth"]
                 mono_invdepth = viewpoint_cam.invdepthmap.cuda()
                 depth_mask = viewpoint_cam.depth_mask.cuda()
+                if block_depth_masker is not None:
+                    mask_start = time.time()
+                    block_mask_cpu = block_depth_masker.mask_for(viewpoint_cam)
+                    depth_mask_project_time = time.time() - mask_start
+                    transfer_start = time.time()
+                    block_mask = block_mask_cpu.to(
+                        device=depth_mask.device,
+                        dtype=depth_mask.dtype,
+                    )
+                    depth_mask_transfer_time = time.time() - transfer_start
+                    depth_mask = depth_mask * block_mask
 
-                Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-                Ll1depth = depth_weight_value * Ll1depth_pure
-                loss += Ll1depth
-                Ll1depth_pure_item = Ll1depth_pure.item()
-                Ll1depth = Ll1depth.item()
+                valid_pixels = depth_mask.sum()
+                depth_mask_pixels = float(valid_pixels.detach().item())
+                depth_mask_coverage = depth_mask_pixels / max(float(depth_mask.numel()), 1.0)
+                min_depth_pixels = float(getattr(opt, "depth_reg_mask_min_pixels", 0))
+                depth_mask_enough = depth_mask_pixels >= min_depth_pixels
+
+                if depth_mask_enough:
+                    Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).sum() / valid_pixels.clamp_min(1.0)
+                    Ll1depth = depth_weight_value * Ll1depth_pure
+                    loss += Ll1depth
+                    Ll1depth_pure_item = Ll1depth_pure.item()
+                    Ll1depth = Ll1depth.item()
+                else:
+                    Ll1depth = 0
+                depth_reg_time = time.time() - depth_reg_start
             else:
                 Ll1depth = 0
             depth_stats = {
                 "enabled": depth_reg_enabled,
-                "applied": depth_reg_enabled and depth_reliable,
+                "applied": depth_reg_enabled and depth_reliable and depth_mask_enough,
                 "reliable": depth_reliable,
                 "l1_loss": Ll1depth,
                 "l1_loss_pure": Ll1depth_pure_item,
                 "weight": depth_weight_value,
+                "mask_mode": depth_mask_mode,
+                "mask_pixels": depth_mask_pixels,
+                "mask_coverage": depth_mask_coverage,
+                "mask_enough": depth_mask_enough,
+                "time_depth_reg": depth_reg_time,
+                "time_depth_mask_project": depth_mask_project_time,
+                "time_depth_mask_transfer": depth_mask_transfer_time,
             }
 
             loss.backward()
@@ -492,6 +541,12 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
             logger.add_scalar('train_loss_patches/depth_l1_weight', depth_stats["weight"], iteration)
             logger.add_scalar('train_loss_patches/depth_reliable', float(depth_stats["reliable"]), iteration)
             logger.add_scalar('train_loss_patches/depth_applied', float(depth_stats["applied"]), iteration)
+            logger.add_scalar('train_loss_patches/depth_mask_enough', float(depth_stats["mask_enough"]), iteration)
+            logger.add_scalar('train_loss_patches/depth_mask_pixels', depth_stats["mask_pixels"], iteration)
+            logger.add_scalar('train_loss_patches/depth_mask_coverage', depth_stats["mask_coverage"], iteration)
+            logger.add_scalar('train_time/depth_reg', depth_stats["time_depth_reg"], iteration)
+            logger.add_scalar('train_time/depth_mask_project', depth_stats["time_depth_mask_project"], iteration)
+            logger.add_scalar('train_time/depth_mask_transfer', depth_stats["time_depth_mask_transfer"], iteration)
         logger.add_scalar('train_time/render', ema_time["render"], iteration)
         logger.add_scalar('train_time/loss', ema_time["loss"], iteration)
         logger.add_scalar('train_time/densify', ema_time["densify"], iteration)

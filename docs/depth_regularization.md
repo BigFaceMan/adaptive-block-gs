@@ -182,6 +182,13 @@ python train.py \
 ```yaml
 dataset:
   depths: depths_any
+
+optimization:
+  depth_reg_mask_mode: block_projection
+  depth_reg_mask_bbox_mode: expanded
+  depth_reg_mask_dilate_px: 16
+  depth_reg_mask_min_pixels: 2048
+  depth_reg_mask_max_points: 100000
 ```
 
 然后继续使用现有分块流程：
