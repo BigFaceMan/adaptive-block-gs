@@ -152,6 +152,8 @@ def get_default_optimization_params():
         depth_reg_mask_dilate_px=16,
         depth_reg_mask_min_pixels=2048,
         depth_reg_mask_max_points=100000,
+        depth_reg_mask_cache=True,
+        depth_reg_mask_cache_max_items=0,
         random_background=False,
         optimizer_type="default",
     )

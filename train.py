@@ -208,6 +208,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             bbox_mode=getattr(opt, "depth_reg_mask_bbox_mode", "expanded"),
             max_points=getattr(opt, "depth_reg_mask_max_points", 100000),
             dilate_px=getattr(opt, "depth_reg_mask_dilate_px", 16),
+            cache_masks=getattr(opt, "depth_reg_mask_cache", True),
+            cache_max_items=getattr(opt, "depth_reg_mask_cache_max_items", 0),
         )
 
     max_cache_num = int(getattr(dataset, "max_cache_num", 0))
@@ -314,6 +316,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             depth_reg_time = 0.0
             depth_mask_project_time = 0.0
             depth_mask_transfer_time = 0.0
+            depth_mask_cache_hit = False
+            depth_mask_cache_size = 0
             depth_reg_start = time.time()
             if depth_weight_value > 0 and depth_reliable:
                 invDepth = render_pkg["depth"]
@@ -321,8 +325,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 depth_mask = viewpoint_cam.depth_mask.cuda()
                 if block_depth_masker is not None:
                     mask_start = time.time()
-                    block_mask_cpu = block_depth_masker.mask_for(viewpoint_cam)
-                    depth_mask_project_time = time.time() - mask_start
+                    block_mask_cpu, depth_mask_cache_hit = block_depth_masker.mask_for(viewpoint_cam)
+                    if not depth_mask_cache_hit:
+                        depth_mask_project_time = time.time() - mask_start
+                    depth_mask_cache_size = block_depth_masker.cache_size
                     transfer_start = time.time()
                     block_mask = block_mask_cpu.to(
                         device=depth_mask.device,
@@ -359,6 +365,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "mask_pixels": depth_mask_pixels,
                 "mask_coverage": depth_mask_coverage,
                 "mask_enough": depth_mask_enough,
+                "mask_cache_hit": depth_mask_cache_hit,
+                "mask_cache_size": depth_mask_cache_size,
                 "time_depth_reg": depth_reg_time,
                 "time_depth_mask_project": depth_mask_project_time,
                 "time_depth_mask_transfer": depth_mask_transfer_time,
@@ -544,6 +552,8 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
             logger.add_scalar('train_loss_patches/depth_mask_enough', float(depth_stats["mask_enough"]), iteration)
             logger.add_scalar('train_loss_patches/depth_mask_pixels', depth_stats["mask_pixels"], iteration)
             logger.add_scalar('train_loss_patches/depth_mask_coverage', depth_stats["mask_coverage"], iteration)
+            logger.add_scalar('train_loss_patches/depth_mask_cache_hit', float(depth_stats["mask_cache_hit"]), iteration)
+            logger.add_scalar('train_loss_patches/depth_mask_cache_size', depth_stats["mask_cache_size"], iteration)
             logger.add_scalar('train_time/depth_reg', depth_stats["time_depth_reg"], iteration)
             logger.add_scalar('train_time/depth_mask_project', depth_stats["time_depth_mask_project"], iteration)
             logger.add_scalar('train_time/depth_mask_transfer', depth_stats["time_depth_mask_transfer"], iteration)

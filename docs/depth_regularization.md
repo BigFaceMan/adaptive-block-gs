@@ -189,7 +189,14 @@ optimization:
   depth_reg_mask_dilate_px: 16
   depth_reg_mask_min_pixels: 2048
   depth_reg_mask_max_points: 100000
+  depth_reg_mask_cache: true
+  depth_reg_mask_cache_max_items: 0
 ```
+
+`block_projection` 会按当前 block 的 coarse points 投影生成 depth mask。开启
+`depth_reg_mask_cache` 后，每张图第一次遇到时生成一次 CPU `uint8` mask，之后训练中复用；
+每个 iter 只把当前图的 mask 临时拷到 GPU。`depth_reg_mask_cache_max_items: 0`
+表示不限制 CPU cache 数量，如果 CPU 内存紧张可以改成固定数量。
 
 然后继续使用现有分块流程：
 

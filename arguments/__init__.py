@@ -130,6 +130,8 @@ class OptimizationParams(ParamGroup):
         self.depth_reg_mask_dilate_px = 16
         self.depth_reg_mask_min_pixels = 2048
         self.depth_reg_mask_max_points = 100000
+        self.depth_reg_mask_cache = True
+        self.depth_reg_mask_cache_max_items = 0
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")
