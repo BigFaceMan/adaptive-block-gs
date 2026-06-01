@@ -172,15 +172,20 @@ def render_args(cfg: ExperimentConfig):
     cfg = _ensure_config(cfg)
     args = common_dataset_args(cfg)
     args.update(common_pipeline_args(cfg))
+    render_source_path = cfg.render.source_path or cfg.dataset.source_path
+    render_depths = cfg.render.depths
+    if not render_depths and os.path.abspath(render_source_path) == os.path.abspath(cfg.dataset.source_path):
+        render_depths = cfg.dataset.depths
     args.update(
         {
             "model_path": cfg.render.model_path or cfg.merge_output_path,
-            "source_path": cfg.render.source_path or cfg.dataset.source_path,
+            "source_path": render_source_path,
             "images": cfg.render.images or cfg.dataset.images,
-            "depths": cfg.render.depths or cfg.dataset.depths,
+            "depths": render_depths,
             "iteration": cfg.render.iteration,
             "skip_train": cfg.render.skip_train,
             "skip_test": cfg.render.skip_test,
+            "render_depth": cfg.render.render_depth,
             "quiet": cfg.render.quiet,
         }
     )

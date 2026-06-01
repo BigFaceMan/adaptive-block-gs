@@ -29,6 +29,7 @@ emit("CFG_PARTITION_PATH", block_training.get("partition_path") or partition_tre
 emit("CFG_OUTPUT_ROOT", block_training.get("blocks_root", os.path.join(output_root, "blocks")))
 emit("CFG_MERGE_OUTPUT_PATH", merge["output_path"])
 emit("CFG_IMAGES", dataset.get("images", "images"))
+emit("CFG_DEPTHS", dataset.get("depths", ""))
 emit("CFG_TEST_IMAGES", dataset.get("test_images") or dataset.get("images", "images"))
 emit("CFG_TEST_DEPTHS", dataset.get("test_depths", ""))
 emit("CFG_ITERATIONS", optimization.get("iterations", 30000))
@@ -49,6 +50,7 @@ PARTITION_PATH="${PARTITION_PATH-${CFG_PARTITION_PATH:-$RUN_ROOT/partitions/part
 OUTPUT_ROOT="${OUTPUT_ROOT-${CFG_OUTPUT_ROOT:-$RUN_ROOT/blocks_coarse_cache}}"
 MERGE_OUTPUT_PATH="${MERGE_OUTPUT_PATH-${CFG_MERGE_OUTPUT_PATH:-$RUN_ROOT/merged_coarse_cache}}"
 IMAGES="${IMAGES-${CFG_IMAGES:-input}}"
+DEPTHS="${DEPTHS-${CFG_DEPTHS:-}}"
 TEST_IMAGES="${TEST_IMAGES-${CFG_TEST_IMAGES:-$IMAGES}}"
 TEST_DEPTHS="${TEST_DEPTHS-${CFG_TEST_DEPTHS:-}}"
 CUDA_IDS="${CUDA_IDS-9}"
@@ -117,6 +119,7 @@ run_block() {
     local block_test_args=()
     local block_test_data_args=()
     local image_load_args=()
+    local depth_args=()
 
     if [ "$SKIP_TRAINED_BLOCKS" = "1" ] && [ -f "$model_ply" ]; then
         echo "Block $block_id already has $model_ply. Skipping train."
@@ -126,6 +129,10 @@ run_block() {
     if [ -n "$EXTRA_TRAIN_ARGS" ]; then
         # shellcheck disable=SC2206
         extra_args=($EXTRA_TRAIN_ARGS)
+    fi
+
+    if [ -n "$DEPTHS" ]; then
+        depth_args=(--depths "$DEPTHS")
     fi
 
     if [ -n "$CONFIG" ]; then
@@ -166,6 +173,7 @@ run_block() {
     CUDA_VISIBLE_DEVICES="$gpu_id" python train.py \
         -s "$TRAIN_DATA_PATH" \
         --images "$IMAGES" \
+        "${depth_args[@]}" \
         -m "$output_path" \
         --iterations "$ITERATIONS" \
         "${block_test_args[@]}" \

@@ -148,6 +148,13 @@ def get_default_optimization_params():
         densify_grad_threshold=0.0002,
         depth_l1_weight_init=1.0,
         depth_l1_weight_final=0.01,
+        depth_reg_mask_mode="full",
+        depth_reg_mask_bbox_mode="expanded",
+        depth_reg_mask_dilate_px=16,
+        depth_reg_mask_min_pixels=2048,
+        depth_reg_mask_max_points=100000,
+        depth_reg_mask_cache=True,
+        depth_reg_mask_cache_max_items=0,
         random_background=False,
         optimizer_type="default",
     )
@@ -270,6 +277,7 @@ def get_default_render_params():
         iteration=-1,
         skip_train=False,
         skip_test=False,
+        render_depth=False,
         quiet=False,
     )
 
