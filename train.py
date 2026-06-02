@@ -175,6 +175,68 @@ def log_validation_depth_images(logger, tag_prefix, iteration, render_pkg, viewp
         logger.add_images(f"{tag_prefix}/inv_depth_error", error_vis[None], global_step=iteration)
 
 
+def estimate_camera_sample_cuda_bytes(viewpoint):
+    if viewpoint is None:
+        return 0
+    total = 0
+    seen = set()
+    for attr in (
+        "original_image",
+        "alpha_mask",
+        "invdepthmap",
+        "depth_mask",
+        "world_view_transform",
+        "projection_matrix",
+        "full_proj_transform",
+        "camera_center",
+    ):
+        value = getattr(viewpoint, attr, None)
+        if not isinstance(value, torch.Tensor) or not value.is_cuda:
+            continue
+        data_ptr = value.data_ptr()
+        if data_ptr in seen:
+            continue
+        seen.add(data_ptr)
+        total += value.numel() * value.element_size()
+    return int(total)
+
+
+def auto_cache_num_from_memory(dataset, train_dataset, current_cache_num, sample_bytes):
+    if not torch.cuda.is_available() or sample_bytes <= 0:
+        return int(current_cache_num)
+
+    reserve_gb = float(getattr(dataset, "auto_cache_reserve_gb", 8.0))
+    max_auto_num = int(getattr(dataset, "auto_cache_max_num", 0))
+    reserve_bytes = max(0.0, reserve_gb) * (1024 ** 3)
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    usable_bytes = max(0, int(free_bytes - reserve_bytes))
+    estimated_num = int(usable_bytes // sample_bytes)
+
+    if max_auto_num > 0:
+        estimated_num = min(estimated_num, max_auto_num)
+    estimated_num = min(estimated_num, len(train_dataset))
+
+    if current_cache_num < 0:
+        target_num = estimated_num
+    else:
+        target_num = max(int(current_cache_num), estimated_num)
+    target_num = min(max(target_num, 1), len(train_dataset))
+
+    print(
+        "[DataLoader] auto cache estimate: "
+        f"free={free_bytes / 1024**3:.2f}GB, "
+        f"total={total_bytes / 1024**3:.2f}GB, "
+        f"reserve={reserve_gb:.2f}GB, "
+        f"sample={sample_bytes / 1024**2:.2f}MB, "
+        f"current={current_cache_num}, "
+        f"target={target_num}"
+    )
+    return target_num
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -222,22 +284,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     )
     if len(train_dataset) == 0:
         raise RuntimeError("No training cameras found")
-    print(
-        "[DataLoader] "
-        f"train_cameras={len(train_dataset)}, "
-        f"max_cache_num={max_cache_num}, "
-        f"cache_workers={getattr(dataset, 'image_cache_workers', 0)}"
-    )
-    camera_loader = CameraDataLoader(
-        train_dataset,
-        batch_size=1,
-        max_cache_num=max_cache_num,
-        cache_workers=getattr(dataset, "image_cache_workers", 0),
-        shuffle=True,
-        seed=getattr(dataset, "image_loader_seed", 42),
-        num_workers=0,
-    )
+    def build_camera_loader(cache_num):
+        print(
+            "[DataLoader] "
+            f"train_cameras={len(train_dataset)}, "
+            f"max_cache_num={cache_num}, "
+            f"cache_workers={getattr(dataset, 'image_cache_workers', 0)}"
+        )
+        return CameraDataLoader(
+            train_dataset,
+            batch_size=1,
+            max_cache_num=cache_num,
+            cache_workers=getattr(dataset, "image_cache_workers", 0),
+            shuffle=True,
+            seed=getattr(dataset, "image_loader_seed", 42),
+            num_workers=0,
+        )
+
+    camera_loader = build_camera_loader(max_cache_num)
     camera_loader_iter = iter(camera_loader)
+    auto_cache_enabled = bool(getattr(dataset, "auto_cache_after_densify", False))
+    auto_cache_done = False
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_time_render = 0.0
@@ -464,10 +531,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.optimizer.step()
                         gaussians.optimizer.zero_grad(set_to_none = True)
 
+                if (
+                    auto_cache_enabled
+                    and not auto_cache_done
+                    and iteration >= opt.densify_until_iter
+                    and iteration < opt.iterations
+                ):
+                    sample_bytes = estimate_camera_sample_cuda_bytes(viewpoint_cam)
+                    if release_viewpoint_after_iter and viewpoint_cam is not None:
+                        viewpoint_cam.release_image()
+                        viewpoint_cam = None
+                    if hasattr(camera_loader_iter, "close"):
+                        camera_loader_iter.close()
+                    camera_loader.close()
+                    target_cache_num = auto_cache_num_from_memory(
+                        dataset,
+                        train_dataset,
+                        camera_loader.max_cache_num,
+                        sample_bytes,
+                    )
+                    if target_cache_num != camera_loader.max_cache_num:
+                        print(
+                            "[DataLoader] switching cache after densify: "
+                            f"{camera_loader.max_cache_num} -> {target_cache_num} "
+                            f"at iteration {iteration}"
+                        )
+                    else:
+                        print(f"[DataLoader] keeping cache max_cache_num={target_cache_num} after densify")
+                    if logger:
+                        logger.add_scalar("data/auto_cache_num", target_cache_num, iteration)
+                        logger.add_scalar("data/auto_cache_sample_mb", sample_bytes / 1024**2, iteration)
+                    max_cache_num = target_cache_num
+                    release_viewpoint_after_iter = max_cache_num == 0
+                    camera_loader = build_camera_loader(max_cache_num)
+                    camera_loader_iter = iter(camera_loader)
+                    auto_cache_done = True
+
                 if (iteration in checkpoint_iterations):
                     print("\n[ITER {}] Saving Checkpoint".format(iteration))
                     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                if release_viewpoint_after_iter:
+                if release_viewpoint_after_iter and viewpoint_cam is not None:
                     viewpoint_cam.release_image()
     finally:
         if hasattr(camera_loader_iter, "close"):

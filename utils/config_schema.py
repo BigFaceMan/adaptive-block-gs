@@ -84,6 +84,9 @@ def get_default_dataset_params():
         image_loader_seed=42,
         max_cache_num=128,
         image_cache_workers=0,
+        auto_cache_after_densify=False,
+        auto_cache_reserve_gb=8.0,
+        auto_cache_max_num=0,
         eval=False,
     )
 

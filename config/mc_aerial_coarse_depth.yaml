@@ -1,6 +1,6 @@
 experiment:
-  name: mc_aerial_coarse_depth_30000
-  output_root: output/mc_aerial_coarse_depth_30000
+  name: mc_aerial_coarse_depth_50000
+  output_root: output/mc_aerial_coarse_depth_50000
 
 dataset:
   source_path: /lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all
@@ -16,6 +16,9 @@ dataset:
   image_loader_seed: 42
   max_cache_num: 512
   image_cache_workers: 8
+  auto_cache_after_densify: true
+  auto_cache_reserve_gb: 6.0
+  auto_cache_max_num: 4096
   eval: false
 
 model:
@@ -28,11 +31,11 @@ pipeline:
   antialiasing: false
 
 optimization:
-  iterations: 30000
+  iterations: 50000
   position_lr_init: 0.000064
   position_lr_final: 0.00000064
   position_lr_delay_mult: 0.01
-  position_lr_max_steps: 30000
+  position_lr_max_steps: 50000
   feature_lr: 0.0025
   opacity_lr: 0.05
   scaling_lr: 0.004
@@ -58,8 +61,8 @@ logging:
   swanlab_workspace: ""
   swanlab_mode: cloud
   swanlab_logdir: ""
-  swanlab_experiment_prefix: mc_aerial_coarse_depth_30000
-  swanlab_experiment_name: mc_aerial_coarse_depth_30000
+  swanlab_experiment_prefix: mc_aerial_coarse_depth_50000
+  swanlab_experiment_name: mc_aerial_coarse_depth_50000
 
 training:
   model_path: ${experiment.output_root}
@@ -71,9 +74,9 @@ training:
   disable_viewer: false
 
 block_training:
-  test_iterations: [7000, 29999]
-  save_iterations: [30000]
-  checkpoint_iterations: [30000]
+  test_iterations: [7000, 30000, 50000]
+  save_iterations: [50000]
+  checkpoint_iterations: [50000]
   start_checkpoint: null
 
 render:
@@ -81,7 +84,7 @@ render:
   source_path: ${dataset.source_path}
   images: ${dataset.images}
   depths: ${dataset.depths}
-  iteration: 30000
+  iteration: 50000
   skip_train: true
   skip_test: false
   render_depth: true

@@ -64,6 +64,9 @@ class ModelParams(ParamGroup):
         self.image_loader_seed = 42
         self.max_cache_num = 128
         self.image_cache_workers = 0
+        self.auto_cache_after_densify = False
+        self.auto_cache_reserve_gb = 8.0
+        self.auto_cache_max_num = 0
         self.partition_path = ""
         self.block_id = ""
         self.partition_bbox_mode = "expanded"

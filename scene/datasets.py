@@ -190,15 +190,33 @@ class CameraDataLoader(DataLoader):
         self.generator = torch.Generator()
         self.generator.manual_seed(seed)
         self.cached = None
+        self._active_cache = None
 
         if self.max_cache_num >= len(self.indices) and len(self.indices) > 0:
             self.max_cache_num = -1
         if self.max_cache_num < 0:
             print("cache all images")
-            self.cached = self._load_data(self.indices)
+            try:
+                self.cached = self._load_data(self.indices)
+            except RuntimeError as exc:
+                if not self._is_cuda_oom(exc) or len(self.indices) <= 1:
+                    raise
+                fallback_cache_num = max(1, len(self.indices) // 2)
+                print(
+                    "[DataLoader] OOM while caching all cameras; "
+                    f"falling back to chunked cache max_cache_num={fallback_cache_num}"
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self.max_cache_num = fallback_cache_num
+                self.cached = None
 
     def __len__(self):
         return len(self.indices)
+
+    @staticmethod
+    def _is_cuda_oom(exc):
+        return "out of memory" in str(exc).lower() and "cuda" in str(exc).lower()
 
     def _epoch_indices(self):
         if self.shuffle:
@@ -220,11 +238,21 @@ class CameraDataLoader(DataLoader):
         return [self.dataset[idx] for idx in tqdm(indices, desc=f"Loading cameras ({len(indices)})")]
 
     @staticmethod
-    def _release_cached(cameras):
+    def _release_cached(cameras, empty_cuda_cache=False):
+        if not cameras:
+            if empty_cuda_cache and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return
         for camera in cameras:
             release = getattr(camera, "release_image", None)
             if release is not None:
                 release()
+        if empty_cuda_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def close(self):
+        self._release_cached(self._active_cache, empty_cuda_cache=True)
+        self._active_cache = None
 
     def __iter__(self):
         if self.max_cache_num < 0:
@@ -241,11 +269,31 @@ class CameraDataLoader(DataLoader):
 
         not_cached = indices.copy()
         while not_cached:
-            to_cache = not_cached[: self.max_cache_num]
-            del not_cached[: self.max_cache_num]
-            cached = self._load_data(to_cache)
+            cache_count = min(self.max_cache_num, len(not_cached))
+            while True:
+                to_cache = not_cached[:cache_count]
+                try:
+                    cached = self._load_data(to_cache)
+                    break
+                except RuntimeError as exc:
+                    if not self._is_cuda_oom(exc) or cache_count <= 1:
+                        raise
+                    self._release_cached(self._active_cache, empty_cuda_cache=True)
+                    self._active_cache = None
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    cache_count = max(1, cache_count // 2)
+                    self.max_cache_num = min(self.max_cache_num, cache_count)
+                    print(
+                        "[DataLoader] OOM while caching cameras; "
+                        f"retrying with max_cache_num={self.max_cache_num}"
+                    )
+            del not_cached[:cache_count]
+            self._active_cache = cached
             try:
                 for camera in cached:
                     yield camera
             finally:
                 self._release_cached(cached)
+                if self._active_cache is cached:
+                    self._active_cache = None
