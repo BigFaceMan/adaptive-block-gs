@@ -1,5 +1,5 @@
 DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/street/pose/block_small/"
-OUTPUT_PATH="/lfs1/users/spsong/Code/gaussian-splatting/output/mc_block_small"
+OUTPUT_PATH="/lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_block_small"
 CUDA_ID=5
 SWANLAB_EXP_NAME="mc_block_A"
 

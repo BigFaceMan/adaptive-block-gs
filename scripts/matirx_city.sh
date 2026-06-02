@@ -1,7 +1,7 @@
 set -euo pipefail
 
 DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/street/pose/block_A/"
-OUTPUT_PATH="/lfs1/users/spsong/Code/gaussian-splatting/output/mc_block_A_40000"
+OUTPUT_PATH="/lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_block_A_40000"
 CUDA_ID=5
 ITERATIONS=40000
 SWANLAB_EXP_NAME="mc_block_A_40000"

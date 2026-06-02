@@ -22,7 +22,7 @@ dataset:
 
 model:
   sh_degree: 3
-  coarse_model: /lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_coarse_30000/point_cloud/iteration_30000/point_cloud.ply
+  coarse_model: /lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_coarse_30000/point_cloud/iteration_30000/point_cloud.ply
 
 pipeline:
   convert_SHs_python: false
@@ -79,7 +79,7 @@ training:
   disable_viewer: false
 
 partition:
-  output_path: /lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_recursive_d5_c32/partitions
+  output_path: /lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_recursive_d5_c32/partitions
   coord_space: contracted
   contract_aabb: [-3.5, -4, -10, 4.5, 2, 10]
   axes: [x, y]
@@ -122,7 +122,7 @@ visualization:
 
 block_training:
   blocks_root: ${experiment.output_root}/blocks
-  partition_path: /lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_recursive_d5_c32/partitions/partition_tree.json
+  partition_path: /lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_recursive_d5_c32/partitions/partition_tree.json
   partition_bbox_mode: core
   partition_init_mode: coarse
   partition_load_test_cameras: false

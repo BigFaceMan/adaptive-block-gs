@@ -19,8 +19,8 @@ fi
 
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH-/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all}"
 TEST_DATA_PATH="${TEST_DATA_PATH-/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/test/block_all_test}"
-COARSE_MODEL="${COARSE_MODEL-/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_block_all_30000/point_cloud/iteration_30000/point_cloud.ply}"
-PARTITION_OUTPUT="${PARTITION_OUTPUT-/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_recursive_depth6/partitions}"
+COARSE_MODEL="${COARSE_MODEL-/lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_block_all_30000/point_cloud/iteration_30000/point_cloud.ply}"
+PARTITION_OUTPUT="${PARTITION_OUTPUT-/lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_recursive_depth6/partitions}"
 IMAGES="${IMAGES-input}"
 TEST_IMAGES="${TEST_IMAGES-$IMAGES}"
 TEST_DEPTHS="${TEST_DEPTHS-}"

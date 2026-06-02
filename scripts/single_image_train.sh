@@ -1,5 +1,5 @@
 DATA_PATH="/lfs3/users/spsong/dataset/MatrixCity/small_city/street/pose/block_1"
-OUTPUT_PATH="/lfs1/users/spsong/Code/gaussian-splatting/output/single_image_test"
+OUTPUT_PATH="/lfs1/users/spsong/Code/project/adaptive-block-gs/output/single_image_test"
 CUDA_ID=5
 SWANLAB_EXP_NAME="single_image_test"
 

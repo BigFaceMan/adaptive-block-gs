@@ -45,7 +45,7 @@ fi
 
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH-${CFG_TRAIN_DATA_PATH:-/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all}}"
 TEST_DATA_PATH="${TEST_DATA_PATH-${CFG_TEST_DATA_PATH:-/lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/test/block_all_test}}"
-RUN_ROOT="${RUN_ROOT-${CFG_RUN_ROOT:-/lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_recursive_depth3}}"
+RUN_ROOT="${RUN_ROOT-${CFG_RUN_ROOT:-/lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_recursive_depth3}}"
 PARTITION_PATH="${PARTITION_PATH-${CFG_PARTITION_PATH:-$RUN_ROOT/partitions/partition_tree.json}}"
 OUTPUT_ROOT="${OUTPUT_ROOT-${CFG_OUTPUT_ROOT:-$RUN_ROOT/blocks_coarse_cache}}"
 MERGE_OUTPUT_PATH="${MERGE_OUTPUT_PATH-${CFG_MERGE_OUTPUT_PATH:-$RUN_ROOT/merged_coarse_cache}}"

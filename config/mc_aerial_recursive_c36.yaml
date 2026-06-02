@@ -20,7 +20,7 @@ dataset:
 
 model:
   sh_degree: 3
-  coarse_model: /lfs1/users/spsong/Code/project/gaussian-splatting/output/mc_aerial_block_all_30000/point_cloud/iteration_30000/point_cloud.ply
+  coarse_model: /lfs1/users/spsong/Code/project/adaptive-block-gs/output/mc_aerial_block_all_30000/point_cloud/iteration_30000/point_cloud.ply
 
 pipeline:
   convert_SHs_python: false
