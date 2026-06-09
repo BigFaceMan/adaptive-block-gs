@@ -96,11 +96,12 @@ if [ ! -f "$CFG_COARSE_MODEL" ]; then
     exit 1
 fi
 if [ "$USE_SHARED_MMAP_IMAGES" = "1" ] && [ "$RUN_TRAIN_BLOCKS" = "1" ]; then
-    if [ "$REBUILD_IMAGE_MMAP_CACHE" = "1" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/manifest.json" ]; then
+    if [ "$REBUILD_IMAGE_MMAP_CACHE" = "1" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/manifest.json" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/depths.float32.bin" ]; then
         echo "Building shared image mmap cache: $IMAGE_MMAP_CACHE_DIR"
         python tools/build_image_mmap_cache.py \
             -s "$CFG_SOURCE_PATH" \
             --images "$CFG_IMAGES" \
+            --depths "$CFG_DEPTHS" \
             -r "$CFG_RESOLUTION" \
             -o "$IMAGE_MMAP_CACHE_DIR"
     else

@@ -31,6 +31,13 @@ class SharedMmapImageCache:
             if os.path.exists(alpha_path):
                 self.alphas = np.memmap(alpha_path, dtype=np.uint8, mode="c")
 
+        depth_file = self.manifest.get("depth_file")
+        self.depths = None
+        if depth_file:
+            depth_path = os.path.join(self.cache_dir, depth_file)
+            if os.path.exists(depth_path):
+                self.depths = np.memmap(depth_path, dtype=np.float32, mode="c")
+
         self.items = self.manifest.get("items", {})
         self._aliases = {}
         for image_name in self.items:
@@ -71,3 +78,16 @@ class SharedMmapImageCache:
         if offset is None:
             return None
         return self._tensor_from_memmap(self.alphas, offset, item["alpha_shape"])
+
+    def depth_tensor(self, image_name):
+        if self.depths is None:
+            return None
+        item = self._item(image_name)
+        offset = item.get("depth_offset")
+        if offset is None:
+            return None
+        return self._tensor_from_memmap(self.depths, offset, item["depth_shape"])
+
+    def depth_reliable(self, image_name):
+        item = self._item(image_name)
+        return bool(item.get("depth_reliable", False))

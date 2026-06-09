@@ -368,10 +368,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             depth_mask_cache_hit = False
             depth_mask_cache_size = 0
             depth_reg_start = time.time()
-            if depth_weight_value > 0 and depth_reliable:
+            if depth_weight_value > 0 and depth_reliable and viewpoint_cam.invdepthmap is not None:
                 invDepth = render_pkg["depth"]
-                mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-                depth_mask = viewpoint_cam.depth_mask.cuda()
+                mono_invdepth = viewpoint_cam.invdepthmap.to("cuda", non_blocking=True)
+                depth_mask = None
+                if viewpoint_cam.depth_mask is not None:
+                    depth_mask = viewpoint_cam.depth_mask.to("cuda", non_blocking=True)
                 if block_depth_masker is not None:
                     mask_start = time.time()
                     block_mask_cpu, depth_mask_cache_hit = block_depth_masker.mask_for(viewpoint_cam)
@@ -380,20 +382,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     depth_mask_cache_size = block_depth_masker.cache_size
                     transfer_start = time.time()
                     block_mask = block_mask_cpu.to(
-                        device=depth_mask.device,
-                        dtype=depth_mask.dtype,
+                        device=mono_invdepth.device,
+                        dtype=mono_invdepth.dtype,
                     )
                     depth_mask_transfer_time = time.time() - transfer_start
-                    depth_mask = depth_mask * block_mask
+                    depth_mask = block_mask if depth_mask is None else depth_mask * block_mask
 
-                valid_pixels = depth_mask.sum()
-                depth_mask_pixels = float(valid_pixels.detach().item())
-                depth_mask_coverage = depth_mask_pixels / max(float(depth_mask.numel()), 1.0)
+                if depth_mask is None:
+                    valid_pixels = mono_invdepth.new_tensor(float(mono_invdepth.numel()))
+                    depth_mask_pixels = float(mono_invdepth.numel())
+                    depth_mask_coverage = 1.0
+                else:
+                    valid_pixels = depth_mask.sum()
+                    depth_mask_pixels = float(valid_pixels.detach().item())
+                    depth_mask_coverage = depth_mask_pixels / max(float(depth_mask.numel()), 1.0)
                 min_depth_pixels = float(getattr(opt, "depth_reg_mask_min_pixels", 0))
                 depth_mask_enough = depth_mask_pixels >= min_depth_pixels
 
                 if depth_mask_enough:
-                    Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).sum() / valid_pixels.clamp_min(1.0)
+                    depth_error = torch.abs(invDepth - mono_invdepth)
+                    if depth_mask is not None:
+                        depth_error = depth_error * depth_mask
+                    Ll1depth_pure = depth_error.sum() / valid_pixels.clamp_min(1.0)
                     Ll1depth = depth_weight_value * Ll1depth_pure
                     loss += Ll1depth
                     Ll1depth_pure_item = Ll1depth_pure.item()

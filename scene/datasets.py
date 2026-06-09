@@ -133,9 +133,15 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
     invdepthmap = None
     depth_mask = None
     depth_reliable = False
-    raw_invdepthmap = _read_invdepth(cam_info.depth_path, is_nerf_synthetic)
+    raw_invdepthmap = None
+    if cam_info.depth_path:
+        if image_cache is not None:
+            invdepthmap = image_cache.depth_tensor(cam_info.image_name)
+            depth_reliable = image_cache.depth_reliable(cam_info.image_name)
+        if invdepthmap is None:
+            raw_invdepthmap = _read_invdepth(cam_info.depth_path, is_nerf_synthetic)
+
     if raw_invdepthmap is not None:
-        depth_mask = torch.ones((1, resolution[1], resolution[0]), dtype=torch.float32, device=data_device)
         raw_invdepthmap = cv2.resize(raw_invdepthmap, resolution)
         raw_invdepthmap[raw_invdepthmap < 0] = 0
         depth_reliable = True
@@ -144,7 +150,6 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
             depth_params = cam_info.depth_params
             if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
                 depth_reliable = False
-                depth_mask *= 0
 
             if depth_params["scale"] > 0:
                 raw_invdepthmap = raw_invdepthmap * depth_params["scale"] + depth_params["offset"]

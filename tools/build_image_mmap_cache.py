@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import argparse
+import cv2
 import json
 import os
 import sys
@@ -48,6 +49,58 @@ def load_uint8_chw(path, resolution):
     return rgb, alpha
 
 
+def load_depth_params(source_path, depths):
+    if not depths:
+        return None
+    depth_params_path = Path(source_path) / "sparse" / "0" / "depth_params.json"
+    with open(depth_params_path, "r") as f:
+        depth_params = json.load(f)
+    scales = np.array([value["scale"] for value in depth_params.values()], dtype=np.float32)
+    positive_scales = scales[scales > 0]
+    med_scale = float(np.median(positive_scales)) if positive_scales.size else 0.0
+    for value in depth_params.values():
+        value["med_scale"] = med_scale
+    return depth_params
+
+
+def read_invdepth(depth_path, is_nerf_synthetic):
+    raw = cv2.imread(str(depth_path), -1)
+    if raw is None:
+        raise RuntimeError(f"Failed to read depth map: {depth_path}")
+    if is_nerf_synthetic:
+        return raw.astype(np.float32) / 512
+    return raw.astype(np.float32) / float(2**16)
+
+
+def load_depth_chw(depth_path, resolution, depth_params):
+    raw_invdepthmap = read_invdepth(depth_path, False)
+    raw_invdepthmap = cv2.resize(raw_invdepthmap, resolution)
+    raw_invdepthmap[raw_invdepthmap < 0] = 0
+    reliable = True
+
+    if depth_params is not None:
+        if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
+            reliable = False
+        if depth_params["scale"] > 0:
+            raw_invdepthmap = raw_invdepthmap * depth_params["scale"] + depth_params["offset"]
+
+    if raw_invdepthmap.ndim != 2:
+        raw_invdepthmap = raw_invdepthmap[..., 0]
+    return raw_invdepthmap[None].astype(np.float32, copy=True), reliable
+
+
+def depth_path_for(image_root, image_path, depths_root):
+    rel_path = image_path.relative_to(image_root)
+    return depths_root / rel_path.with_suffix(".png")
+
+
+def depth_params_for(depth_params, image_name):
+    if depth_params is None:
+        return None
+    stem_name = str(Path(image_name).with_suffix("")).replace("\\", "/")
+    return depth_params.get(stem_name)
+
+
 def image_record(args, image_root, image_path):
     with Image.open(image_path) as image:
         resolution = get_camera_resolution(args, image.width, image.height, 1.0)
@@ -65,6 +118,8 @@ def image_record(args, image_root, image_path):
 
 def build_cache(args):
     image_root, image_paths = find_image_paths(args.source_path, args.images)
+    depths_root = Path(args.source_path) / args.depths if args.depths else None
+    depth_params = load_depth_params(args.source_path, args.depths)
     os.makedirs(args.output, exist_ok=True)
 
     records = [
@@ -74,26 +129,37 @@ def build_cache(args):
 
     image_offset = 0
     alpha_offset = 0
+    depth_offset = 0
     items = {}
     for record in records:
         image_size = int(np.prod(record["image_shape"]))
         alpha_shape = record["alpha_shape"]
         alpha_size = int(np.prod(alpha_shape)) if alpha_shape is not None else 0
+        depth_shape = [1, record["image_shape"][1], record["image_shape"][2]] if depths_root is not None else None
+        depth_size = int(np.prod(depth_shape)) if depth_shape is not None else 0
         items[record["name"]] = {
             "image_offset": image_offset,
             "image_shape": record["image_shape"],
             "alpha_offset": alpha_offset if alpha_shape is not None else None,
             "alpha_shape": alpha_shape,
+            "depth_offset": depth_offset if depth_shape is not None else None,
+            "depth_shape": depth_shape,
+            "depth_reliable": False,
         }
         image_offset += image_size
         alpha_offset += alpha_size
+        depth_offset += depth_size
 
     image_file = "images.uint8.bin"
     alpha_file = "alpha.uint8.bin" if alpha_offset > 0 else None
+    depth_file = "depths.float32.bin" if depth_offset > 0 else None
     image_mm = np.memmap(os.path.join(args.output, image_file), dtype=np.uint8, mode="w+", shape=(image_offset,))
     alpha_mm = None
     if alpha_file:
         alpha_mm = np.memmap(os.path.join(args.output, alpha_file), dtype=np.uint8, mode="w+", shape=(alpha_offset,))
+    depth_mm = None
+    if depth_file:
+        depth_mm = np.memmap(os.path.join(args.output, depth_file), dtype=np.float32, mode="w+", shape=(depth_offset,))
 
     for record in tqdm(records, desc="Writing mmap cache"):
         item = items[record["name"]]
@@ -108,22 +174,39 @@ def build_cache(args):
             end = start + alpha.size
             alpha_mm[start:end] = alpha.reshape(-1)
 
+        if depth_mm is not None:
+            depth_path = depth_path_for(image_root, record["path"], depths_root)
+            depth, reliable = load_depth_chw(
+                depth_path,
+                tuple(record["resolution"]),
+                depth_params_for(depth_params, record["name"]),
+            )
+            start = item["depth_offset"]
+            end = start + depth.size
+            depth_mm[start:end] = depth.reshape(-1)
+            item["depth_reliable"] = bool(reliable)
+
     image_mm.flush()
     if alpha_mm is not None:
         alpha_mm.flush()
+    if depth_mm is not None:
+        depth_mm.flush()
 
     manifest = {
         "version": 1,
         "source_path": os.path.abspath(args.source_path),
         "images": args.images,
+        "depths": args.depths,
         "resolution": int(args.resolution),
         "dtype": "uint8",
         "layout": "CHW",
         "image_file": image_file,
         "alpha_file": alpha_file,
+        "depth_file": depth_file,
         "num_images": len(records),
         "image_bytes": int(image_offset),
         "alpha_bytes": int(alpha_offset),
+        "depth_bytes": int(depth_offset * np.dtype(np.float32).itemsize),
         "items": items,
     }
     with open(os.path.join(args.output, "manifest.json"), "w") as f:
@@ -132,7 +215,8 @@ def build_cache(args):
     print(
         "Wrote shared image mmap cache: "
         f"images={len(records)} image_bytes={image_offset} "
-        f"alpha_bytes={alpha_offset} output={args.output}"
+        f"alpha_bytes={alpha_offset} depth_bytes={depth_offset * np.dtype(np.float32).itemsize} "
+        f"output={args.output}"
     )
 
 
@@ -140,6 +224,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build a shared mmap cache for resized dataset images")
     parser.add_argument("--source_path", "-s", required=True)
     parser.add_argument("--images", default="images")
+    parser.add_argument("--depths", default="")
     parser.add_argument("--resolution", "-r", type=int, default=-1)
     parser.add_argument("--output", "-o", required=True)
     return parser.parse_args()
