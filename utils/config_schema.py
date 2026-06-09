@@ -81,6 +81,8 @@ def get_default_dataset_params():
         white_background=False,
         train_test_exp=False,
         data_device="cpu",
+        image_load_mode="dataloader",
+        image_mmap_cache_dir="",
         image_loader_seed=42,
         max_cache_num=128,
         image_cache_workers=0,

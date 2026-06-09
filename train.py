@@ -27,7 +27,7 @@ from utils.config_utils import (
 )
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import image_to_cuda_float, psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -341,11 +341,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             start = time.time()
             if viewpoint_cam.alpha_mask is not None:
-                alpha_mask = viewpoint_cam.alpha_mask.cuda()
+                alpha_mask = image_to_cuda_float(viewpoint_cam.alpha_mask)
                 image *= alpha_mask
 
             # Loss
-            gt_image = viewpoint_cam.original_image.cuda()
+            gt_image = image_to_cuda_float(viewpoint_cam.original_image)
             Ll1 = l1_loss(image, gt_image)
             if FUSED_SSIM_AVAILABLE:
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -677,7 +677,7 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
                     try:
                         render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                         image = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        gt_image = torch.clamp(image_to_cuda_float(viewpoint.original_image), 0.0, 1.0)
                         if train_test_exp:
                             image = image[..., image.shape[-1] // 2:]
                             gt_image = gt_image[..., gt_image.shape[-1] // 2:]

@@ -20,6 +20,7 @@ from gaussian_renderer import render
 import torchvision
 from scene.datasets import CameraDataLoader, GSCameraDataset
 from utils.general_utils import safe_state
+from utils.image_utils import image_to_cuda_float
 from utils.config_utils import (
     load_yaml_config,
     namespace_from_config,
@@ -79,7 +80,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         try:
             render_pkg = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)
             rendering = render_pkg["render"]
-            gt = view.original_image[0:3, :, :]
+            gt = image_to_cuda_float(view.original_image)[0:3, :, :]
             rendered_invdepth = render_pkg.get("depth")
 
             if train_test_exp:

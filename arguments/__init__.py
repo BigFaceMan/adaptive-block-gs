@@ -61,6 +61,7 @@ class ModelParams(ParamGroup):
         self.camera_load_workers = 0
         self.lazy_load_images = False
         self.image_load_mode = "dataloader"
+        self.image_mmap_cache_dir = ""
         self.image_loader_seed = 42
         self.max_cache_num = 128
         self.image_cache_workers = 0
@@ -86,9 +87,11 @@ class ModelParams(ParamGroup):
             image_load_mode = "dataloader"
         if getattr(g, "lazy_load_images", False):
             print("[DataLoader] Deprecated --lazy_load_images ignored; use --max_cache_num 0 for on-demand loading")
-        if image_load_mode not in {"dataloader", "cache"}:
-            raise ValueError("--image_load_mode must be one of: dataloader, cache")
+        if image_load_mode not in {"dataloader", "cache", "shared_mmap"}:
+            raise ValueError("--image_load_mode must be one of: dataloader, cache, shared_mmap")
         g.image_load_mode = image_load_mode
+        if getattr(g, "image_mmap_cache_dir", ""):
+            g.image_mmap_cache_dir = os.path.abspath(g.image_mmap_cache_dir)
         return g
 
 class PipelineParams(ParamGroup):

@@ -71,6 +71,7 @@ CAMERA_LOAD_WORKERS="${CAMERA_LOAD_WORKERS-2}"
 DATA_DEVICE="${DATA_DEVICE-cpu}"
 LAZY_LOAD_IMAGES="${LAZY_LOAD_IMAGES-0}"
 IMAGE_LOAD_MODE="${IMAGE_LOAD_MODE-cache}"
+IMAGE_MMAP_CACHE_DIR="${IMAGE_MMAP_CACHE_DIR-}"
 MAX_CACHE_NUM="${MAX_CACHE_NUM-512}"
 IMAGE_CACHE_WORKERS="${IMAGE_CACHE_WORKERS-8}"
 PARTITION_BBOX_MODE="${PARTITION_BBOX_MODE-expanded}"
@@ -135,6 +136,17 @@ run_block() {
         depth_args=(--depths "$DEPTHS")
     fi
 
+    if [ "$IMAGE_LOAD_MODE" = "shared_mmap" ]; then
+        if [ -z "$IMAGE_MMAP_CACHE_DIR" ]; then
+            echo "IMAGE_MMAP_CACHE_DIR is required when IMAGE_LOAD_MODE=shared_mmap" >&2
+            return 1
+        fi
+        extra_args+=(
+            --override "dataset.image_load_mode=shared_mmap"
+            --override "dataset.image_mmap_cache_dir=$IMAGE_MMAP_CACHE_DIR"
+        )
+    fi
+
     if [ -n "$CONFIG" ]; then
         echo "Training $block_id on GPU $gpu_id with config $CONFIG"
         CUDA_VISIBLE_DEVICES="$gpu_id" python train.py \
@@ -167,6 +179,13 @@ run_block() {
             --max_cache_num "$MAX_CACHE_NUM"
             --image_cache_workers "$IMAGE_CACHE_WORKERS"
         )
+        if [ "$IMAGE_LOAD_MODE" = "shared_mmap" ]; then
+            if [ -z "$IMAGE_MMAP_CACHE_DIR" ]; then
+                echo "IMAGE_MMAP_CACHE_DIR is required when IMAGE_LOAD_MODE=shared_mmap" >&2
+                return 1
+            fi
+            image_load_args+=(--image_mmap_cache_dir "$IMAGE_MMAP_CACHE_DIR")
+        fi
     fi
 
     echo "Training $block_id on GPU $gpu_id"

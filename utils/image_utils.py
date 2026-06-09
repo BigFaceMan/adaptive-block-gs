@@ -11,6 +11,15 @@
 
 import torch
 
+
+def image_to_cuda_float(image):
+    if image is None:
+        return None
+    if image.dtype == torch.uint8:
+        return image.to(device="cuda", dtype=torch.float32, non_blocking=True).div_(255.0)
+    return image.to(device="cuda", non_blocking=True)
+
+
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
 

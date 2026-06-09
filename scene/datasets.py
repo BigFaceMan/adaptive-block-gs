@@ -7,6 +7,7 @@ from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 
+from scene.image_cache import SharedMmapImageCache
 from utils.camera_utils import get_camera_resolution
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
@@ -89,7 +90,7 @@ def _read_invdepth(depth_path, is_nerf_synthetic):
         raise
 
 
-def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
+def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset, image_cache=None):
     try:
         data_device = torch.device(args.data_device)
     except Exception as e:
@@ -97,18 +98,33 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
         print(f"[Warning] Custom device {args.data_device} failed, fallback to default cuda device")
         data_device = torch.device("cuda")
 
-    with Image.open(cam_info.image_path) as image:
-        orig_w, orig_h = image.size
-        resolution = get_camera_resolution(args, orig_w, orig_h, resolution_scale)
-        resized_image_rgb = PILtoTorch(image, resolution)
-
-    gt_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0).to(data_device)
-    if resized_image_rgb.shape[0] == 4:
-        alpha_mask = resized_image_rgb[3:4, ...].to(data_device)
+    if image_cache is not None:
+        gt_image = image_cache.image_tensor(cam_info.image_name)
+        image_height = int(gt_image.shape[-2])
+        image_width = int(gt_image.shape[-1])
+        resolution = (image_width, image_height)
+        alpha_mask = image_cache.alpha_tensor(cam_info.image_name)
+        if alpha_mask is not None and args.train_test_exp and cam_info.is_test:
+            alpha_mask = alpha_mask.clone()
     else:
-        alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(data_device))
+        with Image.open(cam_info.image_path) as image:
+            orig_w, orig_h = image.size
+            resolution = get_camera_resolution(args, orig_w, orig_h, resolution_scale)
+            resized_image_rgb = PILtoTorch(image, resolution)
+
+        gt_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0).to(data_device)
+        if resized_image_rgb.shape[0] == 4:
+            alpha_mask = resized_image_rgb[3:4, ...].to(data_device)
+        else:
+            alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(data_device))
 
     if args.train_test_exp and cam_info.is_test:
+        if alpha_mask is None:
+            alpha_mask = torch.full(
+                (1, resolution[1], resolution[0]),
+                255,
+                dtype=torch.uint8,
+            )
         if is_test_dataset:
             alpha_mask[..., :alpha_mask.shape[-1] // 2] = 0
         else:
@@ -119,7 +135,7 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
     depth_reliable = False
     raw_invdepthmap = _read_invdepth(cam_info.depth_path, is_nerf_synthetic)
     if raw_invdepthmap is not None:
-        depth_mask = torch.ones_like(alpha_mask)
+        depth_mask = torch.ones((1, resolution[1], resolution[0]), dtype=torch.float32, device=data_device)
         raw_invdepthmap = cv2.resize(raw_invdepthmap, resolution)
         raw_invdepthmap[raw_invdepthmap < 0] = 0
         depth_reliable = True
@@ -161,6 +177,14 @@ class GSCameraDataset(Dataset):
         self.is_nerf_synthetic = is_nerf_synthetic
         self.is_test_dataset = is_test_dataset
         self.scale = scale
+        self.image_cache = None
+        if getattr(args, "image_load_mode", "dataloader") == "shared_mmap":
+            cache_dir = getattr(args, "image_mmap_cache_dir", "")
+            if not cache_dir:
+                raise ValueError("--image_mmap_cache_dir is required when --image_load_mode shared_mmap")
+            self.image_cache = SharedMmapImageCache(cache_dir)
+            self.image_cache.validate_args(args)
+            print(f"[DataLoader] using shared mmap image cache: {cache_dir}")
         if torch.cuda.is_available():
             torch.empty(0, device="cuda")
 
@@ -175,6 +199,7 @@ class GSCameraDataset(Dataset):
             self.scale,
             self.is_nerf_synthetic,
             self.is_test_dataset,
+            self.image_cache,
         )
 
 
