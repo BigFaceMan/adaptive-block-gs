@@ -112,6 +112,8 @@ def get_default_logging_params():
         swanlab_logdir="",
         swanlab_experiment_prefix="experiment",
         swanlab_experiment_name="",
+        swanlab_run_id="",
+        swanlab_resume="",
     )
 
 

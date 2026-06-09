@@ -1,11 +1,11 @@
 experiment:
-  name: mc_aerial_coarse_depth_50000
-  output_root: output/mc_aerial_coarse_depth_50000
+  name: mc_aerial_coarse_50000
+  output_root: output/mc_aerial_coarse_50000
 
 dataset:
   source_path: /lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all
   images: input
-  depths: depths_any
+  depths: ""
   test_source_path: /lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/test/block_all_test
   test_images: input
   test_depths: ""
@@ -14,11 +14,11 @@ dataset:
   train_test_exp: false
   data_device: cuda
   image_loader_seed: 42
-  max_cache_num: 512
+  max_cache_num: 1000
   image_cache_workers: 8
-  auto_cache_after_densify: false
-  auto_cache_reserve_gb: 7.0
-  auto_cache_max_num: 4096
+  auto_cache_after_densify: true
+  auto_cache_reserve_gb: 5.0
+  auto_cache_max_num: 2048
   eval: false
 
 model:
@@ -31,7 +31,7 @@ pipeline:
   antialiasing: false
 
 optimization:
-  iterations: 70000
+  iterations: 50000
   position_lr_init: 0.000064
   position_lr_final: 0.00000064
   position_lr_delay_mult: 0.01
@@ -61,10 +61,8 @@ logging:
   swanlab_workspace: ""
   swanlab_mode: cloud
   swanlab_logdir: ""
-  swanlab_experiment_prefix: mc_aerial_coarse_depth_50000
-  swanlab_experiment_name: mc_aerial_coarse_depth_50000
-  swanlab_run_id: 449k49fndj080fv6fs22o
-  swanlab_resume: must
+  swanlab_experiment_prefix: mc_aerial_coarse_50000
+  swanlab_experiment_name: mc_aerial_coarse_50000
 
 training:
   model_path: ${experiment.output_root}
@@ -76,20 +74,19 @@ training:
   disable_viewer: false
 
 block_training:
-  test_iterations: [60000, 70000]
-  save_iterations: [60000, 70000]
-  checkpoint_iterations: [60000, 70000]
-  start_checkpoint: output/mc_aerial_coarse_depth_50000/chkpnt50000.pth
+  test_iterations: [-1]
+  save_iterations: [50000]
+  checkpoint_iterations: [10000, 20000, 30000, 40000, 50000]
+  start_checkpoint: null
 
 render:
   model_path: ${training.model_path}
   source_path: ${dataset.source_path}
   images: ${dataset.images}
   depths: ${dataset.depths}
-  iteration: 70000
+  iteration: 50000
   skip_train: true
   skip_test: false
-  render_depth: true
   quiet: false
 
 metrics:

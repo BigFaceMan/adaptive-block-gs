@@ -102,7 +102,7 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
         resolution = get_camera_resolution(args, orig_w, orig_h, resolution_scale)
         resized_image_rgb = PILtoTorch(image, resolution)
 
-    gt_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0)
+    gt_image = resized_image_rgb[:3, ...].clamp(0.0, 1.0).to(data_device)
     if resized_image_rgb.shape[0] == 4:
         alpha_mask = resized_image_rgb[3:4, ...].to(data_device)
     else:

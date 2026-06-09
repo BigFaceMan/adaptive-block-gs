@@ -13,7 +13,7 @@ import os
 import torch
 import time
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from scene.datasets import CameraDataLoader, GSCameraDataset
@@ -219,10 +219,7 @@ def auto_cache_num_from_memory(dataset, train_dataset, current_cache_num, sample
         estimated_num = min(estimated_num, max_auto_num)
     estimated_num = min(estimated_num, len(train_dataset))
 
-    if current_cache_num < 0:
-        target_num = estimated_num
-    else:
-        target_num = max(int(current_cache_num), estimated_num)
+    target_num = estimated_num
     target_num = min(max(target_num, 1), len(train_dataset))
 
     print(
@@ -315,21 +312,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
     try:
         for iteration in range(first_iter, opt.iterations + 1):
-            if network_gui.conn == None:
-                network_gui.try_connect()
-            while network_gui.conn != None:
-                try:
-                    net_image_bytes = None
-                    custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                    if custom_cam != None:
-                        net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                    network_gui.send(net_image_bytes, dataset.source_path)
-                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                        break
-                except Exception as e:
-                    network_gui.conn = None
-
             iter_start.record()
 
             gaussians.update_learning_rate(iteration)
@@ -608,6 +590,8 @@ def prepare_output_and_logger(args):
                 workspace=args.swanlab_workspace or None,
                 experiment_name=args.swanlab_experiment_name or None,
                 mode=args.swanlab_mode or None,
+                id=getattr(args, "swanlab_run_id", "") or None,
+                resume=getattr(args, "swanlab_resume", "") or None,
                 config=cfg_args,
                 logdir=logdir,
             )
@@ -763,9 +747,6 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
-    # if not args.disable_viewer:
-    #     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, logger)
 

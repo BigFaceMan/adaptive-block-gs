@@ -102,6 +102,8 @@ class PipelineParams(ParamGroup):
         self.swanlab_workspace = ""
         self.swanlab_mode = "cloud"
         self.swanlab_logdir = ""
+        self.swanlab_run_id = ""
+        self.swanlab_resume = ""
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):

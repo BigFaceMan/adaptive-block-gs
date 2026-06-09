@@ -215,6 +215,8 @@ def common_pipeline_args(cfg: ExperimentConfig):
             "swanlab_mode": cfg.logging.swanlab_mode,
             "swanlab_logdir": cfg.logging.swanlab_logdir,
             "swanlab_experiment_name": cfg.logging.swanlab_experiment_name,
+            "swanlab_run_id": cfg.logging.swanlab_run_id,
+            "swanlab_resume": cfg.logging.swanlab_resume,
         }
     )
     return args
