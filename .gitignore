@@ -39,6 +39,8 @@ runs/
 data/
 datasets/
 submodules/
+demo/
+test/
 
 # Legacy rasterization build outputs
 diff_rasterization/diff_rast.egg-info/
