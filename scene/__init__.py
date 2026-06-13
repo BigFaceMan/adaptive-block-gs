@@ -28,12 +28,12 @@ from utils.partition_utils import (
 )
 
 
-def load_scene_info_from_path(source_path, images, depths, eval_split, train_test_exp, white_background):
+def load_scene_info_from_path(source_path, images, depths, normals, eval_split, train_test_exp, white_background):
     if os.path.exists(os.path.join(source_path, "sparse")):
-        return sceneLoadTypeCallbacks["Colmap"](source_path, images, depths, eval_split, train_test_exp)
+        return sceneLoadTypeCallbacks["Colmap"](source_path, images, depths, normals, eval_split, train_test_exp)
     if os.path.exists(os.path.join(source_path, "transforms_train.json")):
         print("Found transforms_train.json file, assuming Blender data set!")
-        return sceneLoadTypeCallbacks["Blender"](source_path, white_background, depths, eval_split)
+        return sceneLoadTypeCallbacks["Blender"](source_path, white_background, depths, normals, eval_split)
     raise RuntimeError(f"Could not recognize scene type: {source_path}")
 
 
@@ -43,10 +43,12 @@ def load_external_test_scene_info(args):
         return None
     test_images = getattr(args, "test_images", "") or args.images
     test_depths = getattr(args, "test_depths", "")
+    test_normals = getattr(args, "test_normals", "")
     return load_scene_info_from_path(
         test_source_path,
         test_images,
         test_depths,
+        test_normals,
         False,
         getattr(args, "train_test_exp", False),
         getattr(args, "white_background", False),
@@ -76,6 +78,7 @@ class Scene:
             args.source_path,
             args.images,
             args.depths,
+            getattr(args, "normals", ""),
             args.eval,
             args.train_test_exp,
             args.white_background,

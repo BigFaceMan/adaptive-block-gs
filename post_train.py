@@ -119,6 +119,7 @@ def load_post_train_scene_info(args):
         args.source_path,
         args.images,
         args.depths,
+        getattr(args, "normals", ""),
         args.eval,
         args.train_test_exp,
         args.white_background,

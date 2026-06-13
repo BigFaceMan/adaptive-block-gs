@@ -38,6 +38,13 @@ class SharedMmapImageCache:
             if os.path.exists(depth_path):
                 self.depths = np.memmap(depth_path, dtype=np.float32, mode="c")
 
+        normal_file = self.manifest.get("normal_file")
+        self.normals = None
+        if normal_file:
+            normal_path = os.path.join(self.cache_dir, normal_file)
+            if os.path.exists(normal_path):
+                self.normals = np.memmap(normal_path, dtype=np.float32, mode="c")
+
         self.items = self.manifest.get("items", {})
         self._aliases = {}
         for image_name in self.items:
@@ -91,3 +98,16 @@ class SharedMmapImageCache:
     def depth_reliable(self, image_name):
         item = self._item(image_name)
         return bool(item.get("depth_reliable", False))
+
+    def normal_tensor(self, image_name):
+        if self.normals is None:
+            return None
+        item = self._item(image_name)
+        offset = item.get("normal_offset")
+        if offset is None:
+            return None
+        return self._tensor_from_memmap(self.normals, offset, item["normal_shape"])
+
+    def normal_reliable(self, image_name):
+        item = self._item(image_name)
+        return bool(item.get("normal_reliable", False))

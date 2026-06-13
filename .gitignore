@@ -23,6 +23,8 @@ dist/
 
 # Project outputs and logs
 output/
+logs/
+.test/
 tensorboard_3d/
 screenshots/
 swanlog/

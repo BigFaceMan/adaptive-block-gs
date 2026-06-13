@@ -45,6 +45,7 @@ cfg = load_yaml_config(sys.argv[1])
 source_path = get_in(cfg, "dataset.source_path", "")
 images = get_in(cfg, "dataset.images", "images")
 depths = get_in(cfg, "dataset.depths", "")
+normals = get_in(cfg, "dataset.normals", "")
 resolution = get_in(cfg, "dataset.resolution", -1)
 safe_images = str(images).replace("/", "_").replace(" ", "_")
 
@@ -59,6 +60,8 @@ emit("CFG_RESOLUTION", resolution)
 emit("CFG_IMAGE_MMAP_CACHE_DIR", os.path.join(source_path, ".cache", f"images_{safe_images}_r{resolution}"))
 emit("CFG_DEPTHS", depths)
 emit("CFG_DEPTH_DIR", os.path.join(source_path, depths) if depths else "")
+emit("CFG_NORMALS", normals)
+emit("CFG_NORMAL_DIR", os.path.join(source_path, normals) if normals else "")
 emit("CFG_DEPTH_PARAMS", os.path.join(source_path, "sparse/0/depth_params.json"))
 emit("CFG_MAX_DEPTH", get_in(cfg, "partition.max_depth", 3))
 emit("CFG_MAX_BLOCKS", get_in(cfg, "partition.max_blocks", 8))
@@ -95,13 +98,27 @@ if [ ! -f "$CFG_COARSE_MODEL" ]; then
     echo "Coarse model not found: $CFG_COARSE_MODEL" >&2
     exit 1
 fi
+if [ -n "$CFG_NORMALS" ] && [ ! -d "$CFG_NORMAL_DIR" ]; then
+    echo "Normal directory not found: $CFG_NORMAL_DIR" >&2
+    echo "Generate it with scripts/prepare_normal_regularization.sh before training." >&2
+    exit 1
+fi
 if [ "$USE_SHARED_MMAP_IMAGES" = "1" ] && [ "$RUN_TRAIN_BLOCKS" = "1" ]; then
-    if [ "$REBUILD_IMAGE_MMAP_CACHE" = "1" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/manifest.json" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/depths.float32.bin" ]; then
+    normal_cache_missing=0
+    if [ -n "$CFG_NORMALS" ] && [ ! -f "$IMAGE_MMAP_CACHE_DIR/normals.float32.bin" ]; then
+        normal_cache_missing=1
+    fi
+    normal_cache_args=()
+    if [ -n "$CFG_NORMALS" ]; then
+        normal_cache_args=(--normals "$CFG_NORMALS")
+    fi
+    if [ "$REBUILD_IMAGE_MMAP_CACHE" = "1" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/manifest.json" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/depths.float32.bin" ] || [ "$normal_cache_missing" = "1" ]; then
         echo "Building shared image mmap cache: $IMAGE_MMAP_CACHE_DIR"
         python tools/build_image_mmap_cache.py \
             -s "$CFG_SOURCE_PATH" \
             --images "$CFG_IMAGES" \
             --depths "$CFG_DEPTHS" \
+            "${normal_cache_args[@]}" \
             -r "$CFG_RESOLUTION" \
             -o "$IMAGE_MMAP_CACHE_DIR"
     else

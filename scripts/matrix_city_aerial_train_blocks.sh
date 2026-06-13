@@ -30,8 +30,10 @@ emit("CFG_OUTPUT_ROOT", block_training.get("blocks_root", os.path.join(output_ro
 emit("CFG_MERGE_OUTPUT_PATH", merge["output_path"])
 emit("CFG_IMAGES", dataset.get("images", "images"))
 emit("CFG_DEPTHS", dataset.get("depths", ""))
+emit("CFG_NORMALS", dataset.get("normals", ""))
 emit("CFG_TEST_IMAGES", dataset.get("test_images") or dataset.get("images", "images"))
 emit("CFG_TEST_DEPTHS", dataset.get("test_depths", ""))
+emit("CFG_TEST_NORMALS", dataset.get("test_normals", ""))
 emit("CFG_ITERATIONS", optimization.get("iterations", 30000))
 emit("CFG_MERGE_ITERATION", merge.get("iteration", optimization.get("iterations", 30000)))
 emit("CFG_LOG_ROOT", os.path.join(output_root, "logs"))
@@ -51,8 +53,10 @@ OUTPUT_ROOT="${OUTPUT_ROOT-${CFG_OUTPUT_ROOT:-$RUN_ROOT/blocks_coarse_cache}}"
 MERGE_OUTPUT_PATH="${MERGE_OUTPUT_PATH-${CFG_MERGE_OUTPUT_PATH:-$RUN_ROOT/merged_coarse_cache}}"
 IMAGES="${IMAGES-${CFG_IMAGES:-input}}"
 DEPTHS="${DEPTHS-${CFG_DEPTHS:-}}"
+NORMALS="${NORMALS-${CFG_NORMALS:-}}"
 TEST_IMAGES="${TEST_IMAGES-${CFG_TEST_IMAGES:-$IMAGES}}"
 TEST_DEPTHS="${TEST_DEPTHS-${CFG_TEST_DEPTHS:-}}"
+TEST_NORMALS="${TEST_NORMALS-${CFG_TEST_NORMALS:-}}"
 CUDA_IDS="${CUDA_IDS-9}"
 MAX_PARALLEL="${MAX_PARALLEL-}"
 ITERATIONS="${ITERATIONS-${CFG_ITERATIONS:-30000}}"
@@ -121,6 +125,7 @@ run_block() {
     local block_test_data_args=()
     local image_load_args=()
     local depth_args=()
+    local normal_args=()
 
     if [ "$SKIP_TRAINED_BLOCKS" = "1" ] && [ -f "$model_ply" ]; then
         echo "Block $block_id already has $model_ply. Skipping train."
@@ -134,6 +139,9 @@ run_block() {
 
     if [ -n "$DEPTHS" ]; then
         depth_args=(--depths "$DEPTHS")
+    fi
+    if [ -n "$NORMALS" ]; then
+        normal_args=(--normals "$NORMALS")
     fi
 
     if [ "$IMAGE_LOAD_MODE" = "shared_mmap" ]; then
@@ -169,6 +177,9 @@ run_block() {
             --test_images "$TEST_IMAGES"
             --test_depths "$TEST_DEPTHS"
         )
+        if [ -n "$TEST_NORMALS" ]; then
+            block_test_data_args+=(--test_normals "$TEST_NORMALS")
+        fi
     fi
 
     if [ "$LAZY_LOAD_IMAGES" = "1" ]; then
@@ -193,6 +204,7 @@ run_block() {
         -s "$TRAIN_DATA_PATH" \
         --images "$IMAGES" \
         "${depth_args[@]}" \
+        "${normal_args[@]}" \
         -m "$output_path" \
         --iterations "$ITERATIONS" \
         "${block_test_args[@]}" \

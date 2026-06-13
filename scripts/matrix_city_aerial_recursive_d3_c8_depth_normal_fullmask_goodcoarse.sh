@@ -4,9 +4,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-CONFIG="${CONFIG:-config/mc_aerial_recursive_d3_c8_depth_fullmask_4w.yaml}"
+CONFIG="${CONFIG:-config/mc_aerial_recursive_d3_c8_depth_normal_fullmask_goodcoarse.yaml}"
 SOURCE_PARTITION_TREE="${SOURCE_PARTITION_TREE:-output/mc_aerial_recursive_d3_c8_depth/partitions/partition_tree.json}"
-CUDA_IDS="${CUDA_IDS:-2,3,4,5,6,7,8,9}"
+CUDA_IDS="${CUDA_IDS:-1,3,4,5,6,7,8,9}"
 MAX_PARALLEL="${MAX_PARALLEL:-8}"
 
 RUN_PARTITION="${RUN_PARTITION:-0}"
@@ -16,6 +16,7 @@ RUN_RENDER_EVAL="${RUN_RENDER_EVAL:-1}"
 RUN_METRICS="${RUN_METRICS:-1}"
 USE_SHARED_MMAP_IMAGES="${USE_SHARED_MMAP_IMAGES:-1}"
 REBUILD_IMAGE_MMAP_CACHE="${REBUILD_IMAGE_MMAP_CACHE:-0}"
+REQUIRE_NORMAL_MMAP_CACHE="${REQUIRE_NORMAL_MMAP_CACHE:-1}"
 
 FORCE_PARTITION="${FORCE_PARTITION:-0}"
 SYNC_PARTITION_TREE="${SYNC_PARTITION_TREE:-1}"
@@ -48,6 +49,7 @@ depths = get_in(cfg, "dataset.depths", "")
 normals = get_in(cfg, "dataset.normals", "")
 resolution = get_in(cfg, "dataset.resolution", -1)
 safe_images = str(images).replace("/", "_").replace(" ", "_")
+normal_cache = os.path.join(source_path, ".cache", f"images_{safe_images}_r{resolution}_normal")
 
 def emit(name, value):
     print(f"{name}={shlex.quote(str(value))}")
@@ -57,7 +59,7 @@ emit("CFG_COARSE_MODEL", get_in(cfg, "model.coarse_model", ""))
 emit("CFG_SOURCE_PATH", source_path)
 emit("CFG_IMAGES", images)
 emit("CFG_RESOLUTION", resolution)
-emit("CFG_IMAGE_MMAP_CACHE_DIR", os.path.join(source_path, ".cache", f"images_{safe_images}_r{resolution}"))
+emit("CFG_IMAGE_MMAP_CACHE_DIR", get_in(cfg, "dataset.image_mmap_cache_dir", "") or normal_cache)
 emit("CFG_DEPTHS", depths)
 emit("CFG_DEPTH_DIR", os.path.join(source_path, depths) if depths else "")
 emit("CFG_NORMALS", normals)
@@ -66,6 +68,11 @@ emit("CFG_DEPTH_PARAMS", os.path.join(source_path, "sparse/0/depth_params.json")
 emit("CFG_MAX_DEPTH", get_in(cfg, "partition.max_depth", 3))
 emit("CFG_MAX_BLOCKS", get_in(cfg, "partition.max_blocks", 8))
 emit("CFG_DEPTH_MASK_MODE", get_in(cfg, "optimization.depth_reg_mask_mode", "full"))
+emit("CFG_DEPTH_WEIGHT_INIT", get_in(cfg, "optimization.depth_l1_weight_init", 0.0))
+emit("CFG_DEPTH_WEIGHT_FINAL", get_in(cfg, "optimization.depth_l1_weight_final", 0.0))
+emit("CFG_NORMAL_WEIGHT_INIT", get_in(cfg, "optimization.normal_weight_init", 0.0))
+emit("CFG_NORMAL_WEIGHT_FINAL", get_in(cfg, "optimization.normal_weight_final", 0.0))
+emit("CFG_NORMAL_START_ITER", get_in(cfg, "optimization.normal_start_iter", 0))
 PY
 )"
 
@@ -77,7 +84,7 @@ if [ "$USE_SHARED_MMAP_IMAGES" = "1" ]; then
 fi
 
 if [ -z "$CFG_DEPTHS" ]; then
-    echo "Full-depth regularization requires dataset.depths in $CONFIG" >&2
+    echo "Depth+normal block regularization requires dataset.depths in $CONFIG" >&2
     exit 1
 fi
 if [ "$CFG_DEPTH_MASK_MODE" != "full" ]; then
@@ -94,35 +101,38 @@ if [ ! -f "$CFG_DEPTH_PARAMS" ]; then
     echo "Generate it with scripts/prepare_depth_regularization.sh before training." >&2
     exit 1
 fi
-if [ ! -f "$CFG_COARSE_MODEL" ]; then
-    echo "Coarse model not found: $CFG_COARSE_MODEL" >&2
+if [ -z "$CFG_NORMALS" ]; then
+    echo "Depth+normal block regularization requires dataset.normals in $CONFIG" >&2
     exit 1
 fi
-if [ -n "$CFG_NORMALS" ] && [ ! -d "$CFG_NORMAL_DIR" ]; then
+if [ ! -d "$CFG_NORMAL_DIR" ]; then
     echo "Normal directory not found: $CFG_NORMAL_DIR" >&2
     echo "Generate it with scripts/prepare_normal_regularization.sh before training." >&2
     exit 1
 fi
+if [ ! -f "$CFG_COARSE_MODEL" ]; then
+    echo "Coarse model not found: $CFG_COARSE_MODEL" >&2
+    exit 1
+fi
+
 if [ "$USE_SHARED_MMAP_IMAGES" = "1" ] && [ "$RUN_TRAIN_BLOCKS" = "1" ]; then
     normal_cache_missing=0
-    if [ -n "$CFG_NORMALS" ] && [ ! -f "$IMAGE_MMAP_CACHE_DIR/normals.float32.bin" ]; then
+    if [ "$REQUIRE_NORMAL_MMAP_CACHE" = "1" ] && [ ! -f "$IMAGE_MMAP_CACHE_DIR/normals.float32.bin" ]; then
         normal_cache_missing=1
     fi
-    normal_cache_args=()
-    if [ -n "$CFG_NORMALS" ]; then
-        normal_cache_args=(--normals "$CFG_NORMALS")
-    fi
-    if [ "$REBUILD_IMAGE_MMAP_CACHE" = "1" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/manifest.json" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/depths.float32.bin" ] || [ "$normal_cache_missing" = "1" ]; then
-        echo "Building shared image mmap cache: $IMAGE_MMAP_CACHE_DIR"
+    if [ "$REBUILD_IMAGE_MMAP_CACHE" = "1" ] || [ ! -f "$IMAGE_MMAP_CACHE_DIR/manifest.json" ] || [ "$normal_cache_missing" = "1" ]; then
+        echo "Building shared image/normal mmap cache: $IMAGE_MMAP_CACHE_DIR"
         python tools/build_image_mmap_cache.py \
             -s "$CFG_SOURCE_PATH" \
             --images "$CFG_IMAGES" \
-            --depths "$CFG_DEPTHS" \
-            "${normal_cache_args[@]}" \
+            --normals "$CFG_NORMALS" \
             -r "$CFG_RESOLUTION" \
             -o "$IMAGE_MMAP_CACHE_DIR"
     else
-        echo "Using existing shared image mmap cache: $IMAGE_MMAP_CACHE_DIR"
+        echo "Using existing shared image/normal mmap cache: $IMAGE_MMAP_CACHE_DIR"
+        if [ ! -f "$IMAGE_MMAP_CACHE_DIR/depths.float32.bin" ]; then
+            echo "Depth mmap is not required; depth maps will fall back to dataset.depths files."
+        fi
     fi
 fi
 
@@ -218,16 +228,19 @@ print(f"Blocks: {len(blocks)}")
 print(f"Coarse model: {coarse_model}")
 PY
 
-echo "Running d3/c8 full-depth-reg training / merge / render eval / metrics..."
+echo "Running d3/c8 full-depth+normal-reg training / merge / render eval / metrics..."
 echo "Config: $CONFIG"
 echo "Source partition: $SOURCE_PARTITION_TREE"
-echo "Depth partition: $PARTITION_TREE"
+echo "Depth+normal partition: $PARTITION_TREE"
 echo "Depth mask mode: $CFG_DEPTH_MASK_MODE"
+echo "Depth weights: $CFG_DEPTH_WEIGHT_INIT -> $CFG_DEPTH_WEIGHT_FINAL"
+echo "Normal weights: $CFG_NORMAL_WEIGHT_INIT -> $CFG_NORMAL_WEIGHT_FINAL"
+echo "Normal start iter: $CFG_NORMAL_START_ITER"
 echo "CUDA_IDS: $CUDA_IDS"
 echo "MAX_PARALLEL: $MAX_PARALLEL"
 echo "Shared mmap images: $USE_SHARED_MMAP_IMAGES"
 if [ "$USE_SHARED_MMAP_IMAGES" = "1" ]; then
-    echo "Image mmap cache: $IMAGE_MMAP_CACHE_DIR"
+    echo "Image/normal mmap cache: $IMAGE_MMAP_CACHE_DIR"
 fi
 
 CONFIG="$CONFIG" \

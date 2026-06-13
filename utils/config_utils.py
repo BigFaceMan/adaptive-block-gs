@@ -176,12 +176,16 @@ def render_args(cfg: ExperimentConfig):
     render_depths = cfg.render.depths
     if not render_depths and os.path.abspath(render_source_path) == os.path.abspath(cfg.dataset.source_path):
         render_depths = cfg.dataset.depths
+    render_normals = getattr(cfg.render, "normals", "")
+    if not render_normals and os.path.abspath(render_source_path) == os.path.abspath(cfg.dataset.source_path):
+        render_normals = getattr(cfg.dataset, "normals", "")
     args.update(
         {
             "model_path": cfg.render.model_path or cfg.merge_output_path,
             "source_path": render_source_path,
             "images": cfg.render.images or cfg.dataset.images,
             "depths": render_depths,
+            "normals": render_normals,
             "iteration": cfg.render.iteration,
             "skip_train": cfg.render.skip_train,
             "skip_test": cfg.render.skip_test,

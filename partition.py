@@ -234,13 +234,14 @@ def config_from_legacy_args(args) -> ExperimentConfig:
     )
 
 
-def load_scene_info_from_path(source_path, images, depths, eval_split, train_test_exp, white_background):
+def load_scene_info_from_path(source_path, images, depths, eval_split, train_test_exp, white_background, normals=""):
     source_path = os.path.abspath(source_path)
     if os.path.exists(os.path.join(source_path, "sparse")):
         return sceneLoadTypeCallbacks["Colmap"](
             source_path,
             images,
             depths,
+            normals,
             eval_split,
             train_test_exp,
         )
@@ -250,6 +251,7 @@ def load_scene_info_from_path(source_path, images, depths, eval_split, train_tes
             source_path,
             white_background,
             depths,
+            normals,
             eval_split,
         )
     raise RuntimeError(f"Could not recognize scene type: {source_path}")
@@ -263,6 +265,7 @@ def load_scene_info(cfg: ExperimentConfig):
         cfg.dataset.eval,
         cfg.dataset.train_test_exp,
         cfg.dataset.white_background,
+        getattr(cfg.dataset, "normals", ""),
     )
 
 
@@ -1501,6 +1504,7 @@ def main():
             False,
             dataset.train_test_exp,
             dataset.white_background,
+            getattr(dataset, "test_normals", ""),
         )
         test_cameras_pool = all_camera_infos(test_scene_info)
         log(f"loaded external test cameras: {len(test_cameras_pool)}")
