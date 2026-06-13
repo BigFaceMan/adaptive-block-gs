@@ -1,0 +1,120 @@
+experiment:
+  name: mc_aerial_coarse_depth_pseudo_late_3w
+  output_root: output/mc_aerial_coarse_depth_pseudo_late_3w
+
+dataset:
+  source_path: /lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/train/block_all
+  images: input
+  depths: depths_any
+  normals: ""
+  test_source_path: /lfs3/users/spsong/dataset/MatrixCity/small_city/aerial/test/block_all_test
+  test_images: input
+  test_depths: ""
+  test_normals: ""
+  resolution: -1
+  white_background: false
+  train_test_exp: false
+  data_device: cuda
+  image_loader_seed: 42
+  max_cache_num: 512
+  image_cache_workers: 8
+  auto_cache_after_densify: false
+  auto_cache_reserve_gb: 7.0
+  auto_cache_max_num: 4096
+  eval: false
+
+model:
+  sh_degree: 3
+
+pipeline:
+  convert_SHs_python: false
+  compute_cov3D_python: false
+  debug: false
+  antialiasing: false
+
+optimization:
+  iterations: 30000
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  position_lr_delay_mult: 0.01
+  position_lr_max_steps: 30000
+  feature_lr: 0.0025
+  opacity_lr: 0.025
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  exposure_lr_init: 0.01
+  exposure_lr_final: 0.001
+  exposure_lr_delay_steps: 0
+  exposure_lr_delay_mult: 0.0
+  percent_dense: 0.01
+  lambda_dssim: 0.2
+  densification_interval: 500
+  opacity_reset_interval: 20000
+  densify_from_iter: 1000
+  densify_until_iter: 20000
+  densify_grad_threshold: 0.0002
+  depth_l1_weight_init: 1.0
+  depth_l1_weight_final: 0.1
+  depth_reg_mask_mode: full
+  depth_reg_mask_bbox_mode: expanded
+  depth_reg_mask_dilate_px: 16
+  depth_reg_mask_min_pixels: 2048
+  depth_reg_mask_max_points: 100000
+  depth_reg_mask_cache: true
+  depth_reg_mask_cache_max_items: 0
+  normal_weight_init: 0.0
+  normal_weight_final: 0.0
+  normal_start_iter: 0
+  pseudo_view_weight_init: 0.01
+  pseudo_view_weight_final: 0.5
+  pseudo_view_start_iter: 10000
+  pseudo_view_end_iter: 30000
+  pseudo_view_interval: 1
+  pseudo_view_shift_ratio: 0.05
+  pseudo_view_random_sign: false
+  pseudo_view_mask_mode: valid
+  pseudo_view_depth_rel_thresh: 0.05
+  pseudo_view_min_pixels: 2048
+  pseudo_view_detach_ref_depth: true
+  random_background: false
+  optimizer_type: default
+
+logging:
+  swanlab_project: block-gs
+  swanlab_workspace: ""
+  swanlab_mode: cloud
+  swanlab_logdir: ""
+  swanlab_experiment_prefix: mc_aerial_coarse_depth_pseudo_late_3w
+  swanlab_experiment_name: mc_aerial_coarse_depth_pseudo_late_3w
+  swanlab_run_id: ""
+  swanlab_resume: ""
+
+training:
+  model_path: ${experiment.output_root}
+  ip: 127.0.0.1
+  port: 6009
+  debug_from: -1
+  detect_anomaly: false
+  quiet: false
+  disable_viewer: false
+
+block_training:
+  test_iterations: [30000]
+  save_iterations: [30000]
+  checkpoint_iterations: [30000]
+  start_checkpoint: null
+
+render:
+  model_path: ${training.model_path}
+  source_path: ${dataset.source_path}
+  images: ${dataset.images}
+  depths: ${dataset.depths}
+  normals: ""
+  iteration: 30000
+  skip_train: true
+  skip_test: false
+  render_depth: true
+  quiet: false
+
+metrics:
+  model_paths: ["${training.model_path}"]

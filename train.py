@@ -20,6 +20,7 @@ from scene import Scene, GaussianModel
 from scene.datasets import CameraDataLoader, GSCameraDataset
 from utils.block_depth_mask import BlockDepthMasker
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.pseudo_view import make_pseudo_view_camera, pseudo_view_reprojection_loss
 from utils.config_utils import (
     load_yaml_config,
     namespace_from_config,
@@ -515,6 +516,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         normal_weight_constant = max(normal_weight_init, normal_weight_final)
         normal_weight = lambda _step: normal_weight_constant
+
+    pseudo_weight_init = float(getattr(opt, "pseudo_view_weight_init", 0.0))
+    pseudo_weight_final = float(getattr(opt, "pseudo_view_weight_final", 0.0))
+    pseudo_start_iter = max(0, int(getattr(opt, "pseudo_view_start_iter", 5000)))
+    pseudo_end_iter = int(getattr(opt, "pseudo_view_end_iter", 0))
+    if pseudo_end_iter <= 0:
+        pseudo_end_iter = int(getattr(opt, "densify_until_iter", opt.iterations))
+    pseudo_end_iter = min(pseudo_end_iter, int(opt.iterations))
+    pseudo_interval = max(1, int(getattr(opt, "pseudo_view_interval", 1)))
+    pseudo_weight_max_steps = max(1, pseudo_end_iter - pseudo_start_iter + 1)
+    if pseudo_weight_init > 0.0 and pseudo_weight_final > 0.0:
+        pseudo_view_weight = get_expon_lr_func(
+            pseudo_weight_init,
+            pseudo_weight_final,
+            max_steps=pseudo_weight_max_steps,
+        )
+    else:
+        pseudo_weight_constant = max(pseudo_weight_init, pseudo_weight_final)
+        pseudo_view_weight = lambda _step: pseudo_weight_constant
+
     depth_mask_mode = getattr(opt, "depth_reg_mask_mode", "full") or "full"
     if depth_mask_mode not in {"full", "block_projection"}:
         raise ValueError("--depth_reg_mask_mode must be 'full' or 'block_projection'")
@@ -565,6 +586,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     ema_Lnormal_for_log = 0.0
+    ema_Lpseudo_for_log = 0.0
     ema_time_render = 0.0
     ema_time_loss = 0.0
     ema_time_densify = 0.0
@@ -711,6 +733,85 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "time_depth_mask_transfer": depth_mask_transfer_time,
             }
 
+            # Pseudo-view reprojection regularization, intended to affect pruning-stage floaters.
+            pseudo_reg_enabled = max(pseudo_weight_init, pseudo_weight_final) > 0.0 and pseudo_end_iter >= pseudo_start_iter
+            pseudo_active = (
+                pseudo_reg_enabled
+                and pseudo_start_iter <= iteration <= pseudo_end_iter
+                and (iteration - pseudo_start_iter) % pseudo_interval == 0
+            )
+            pseudo_weight_value = 0.0
+            Lpseudo = 0.0
+            Lpseudo_pure_item = 0.0
+            pseudo_mask_pixels = 0.0
+            pseudo_mask_coverage = 0.0
+            pseudo_mask_enough = False
+            pseudo_valid_depth = False
+            pseudo_shift = 0.0
+            pseudo_reg_time = 0.0
+            if pseudo_active:
+                pseudo_start = time.time()
+                pseudo_weight_step = iteration - pseudo_start_iter + 1
+                pseudo_weight_value = pseudo_view_weight(pseudo_weight_step)
+                pseudo_camera, pseudo_camera_stats = make_pseudo_view_camera(
+                    viewpoint_cam,
+                    render_pkg["depth"],
+                    shift_ratio=float(getattr(opt, "pseudo_view_shift_ratio", 0.03)),
+                    random_sign=bool(getattr(opt, "pseudo_view_random_sign", True)),
+                    detach_depth=bool(getattr(opt, "pseudo_view_detach_ref_depth", True)),
+                )
+                pseudo_shift = pseudo_camera_stats.get("shift", 0.0)
+                pseudo_valid_depth = bool(pseudo_camera_stats.get("valid_depth", False))
+                if pseudo_camera is not None and pseudo_weight_value > 0.0:
+                    pseudo_render_pkg = render(
+                        pseudo_camera,
+                        gaussians,
+                        pipe,
+                        bg,
+                        use_trained_exp=dataset.train_test_exp,
+                        separate_sh=SPARSE_ADAM_AVAILABLE,
+                    )
+                    Lpseudo_pure, pseudo_loss_stats = pseudo_view_reprojection_loss(
+                        viewpoint_cam,
+                        pseudo_camera,
+                        render_pkg["depth"],
+                        pseudo_render_pkg["depth"],
+                        pseudo_render_pkg["render"],
+                        gt_image,
+                        mask_mode=getattr(opt, "pseudo_view_mask_mode", "valid"),
+                        depth_rel_thresh=float(getattr(opt, "pseudo_view_depth_rel_thresh", 0.05)),
+                        min_pixels=float(getattr(opt, "pseudo_view_min_pixels", 2048)),
+                        detach_ref_depth=bool(getattr(opt, "pseudo_view_detach_ref_depth", True)),
+                    )
+                    pseudo_mask_pixels = pseudo_loss_stats.get("mask_pixels", 0.0)
+                    pseudo_mask_coverage = pseudo_loss_stats.get("mask_coverage", 0.0)
+                    pseudo_mask_enough = bool(pseudo_loss_stats.get("mask_enough", False))
+                    if Lpseudo_pure is not None:
+                        Lpseudo_tensor = pseudo_weight_value * Lpseudo_pure
+                        loss += Lpseudo_tensor
+                        Lpseudo_pure_item = Lpseudo_pure.item()
+                        Lpseudo = Lpseudo_tensor.item()
+                pseudo_reg_time = time.time() - pseudo_start
+            pseudo_stats = {
+                "enabled": pseudo_reg_enabled,
+                "active": pseudo_active,
+                "applied": pseudo_active and pseudo_mask_enough,
+                "valid_depth": pseudo_valid_depth,
+                "loss": Lpseudo,
+                "loss_pure": Lpseudo_pure_item,
+                "weight": pseudo_weight_value,
+                "start_iter": pseudo_start_iter,
+                "end_iter": pseudo_end_iter,
+                "interval": pseudo_interval,
+                "mask_pixels": pseudo_mask_pixels,
+                "mask_coverage": pseudo_mask_coverage,
+                "mask_enough": pseudo_mask_enough,
+                "shift": pseudo_shift,
+                "shift_ratio": float(getattr(opt, "pseudo_view_shift_ratio", 0.03)),
+                "depth_rel_thresh": float(getattr(opt, "pseudo_view_depth_rel_thresh", 0.05)),
+                "time_pseudo_reg": pseudo_reg_time,
+            }
+
             # Normal regularization
             normal_reg_enabled = normal_weight_value > 0
             normal_reliable = bool(getattr(viewpoint_cam, "normal_reliable", False))
@@ -852,12 +953,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
                 ema_Lnormal_for_log = 0.4 * Lnormal + 0.6 * ema_Lnormal_for_log
+                ema_Lpseudo_for_log = 0.4 * Lpseudo + 0.6 * ema_Lpseudo_for_log
 
                 if iteration % 10 == 0:
                     progress_bar.set_postfix({
                         "Loss": f"{ema_loss_for_log:.{7}f}",
                         "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
                         "Normal Loss": f"{ema_Lnormal_for_log:.{7}f}",
+                        "Pseudo Loss": f"{ema_Lpseudo_for_log:.{7}f}",
                     })
                     progress_bar.update(10)
                 if iteration == opt.iterations:
@@ -874,7 +977,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 }
 
                 # Log and save
-                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset, depth_stats, normal_stats)
+                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset, depth_stats, normal_stats, pseudo_stats)
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
@@ -1052,7 +1155,7 @@ def log_training_observations(logger, iteration, gaussians, radii, visibility_fi
         group_name = group.get("name", "unknown")
         logger.add_scalar(f"optimizer/lr_{group_name}", group["lr"], iteration)
 
-def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None, normal_stats=None):
+def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None, normal_stats=None, pseudo_stats=None):
     if logger and iteration % 10 == 0:
         logger.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         logger.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -1099,6 +1202,23 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
             logger.add_scalar('train_loss_patches/normal_confidence_depth_floor', normal_stats["confidence_depth_floor"], iteration)
             logger.add_scalar('train_loss_patches/normal_confidence_min', normal_stats["confidence_min"], iteration)
             logger.add_scalar('train_time/normal_reg', normal_stats["time_normal_reg"], iteration)
+        if pseudo_stats and pseudo_stats.get("enabled", False):
+            logger.add_scalar('train_loss_patches/pseudo_view_loss', pseudo_stats["loss"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_loss_pure', pseudo_stats["loss_pure"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_weight', pseudo_stats["weight"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_active', float(pseudo_stats["active"]), iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_applied', float(pseudo_stats["applied"]), iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_valid_depth', float(pseudo_stats["valid_depth"]), iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_mask_pixels', pseudo_stats["mask_pixels"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_mask_coverage', pseudo_stats["mask_coverage"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_mask_enough', float(pseudo_stats["mask_enough"]), iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_shift', pseudo_stats["shift"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_shift_ratio', pseudo_stats["shift_ratio"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_depth_rel_thresh', pseudo_stats["depth_rel_thresh"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_start_iter', pseudo_stats["start_iter"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_end_iter', pseudo_stats["end_iter"], iteration)
+            logger.add_scalar('train_loss_patches/pseudo_view_interval', pseudo_stats["interval"], iteration)
+            logger.add_scalar('train_time/pseudo_view_reg', pseudo_stats["time_pseudo_reg"], iteration)
         logger.add_scalar('train_time/render', ema_time["render"], iteration)
         logger.add_scalar('train_time/loss', ema_time["loss"], iteration)
         logger.add_scalar('train_time/densify', ema_time["densify"], iteration)

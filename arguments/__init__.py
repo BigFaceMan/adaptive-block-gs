@@ -156,6 +156,17 @@ class OptimizationParams(ParamGroup):
         self.normal_confidence_edge_floor = 0.0
         self.normal_confidence_depth_floor = 0.0
         self.normal_confidence_min = 0.0
+        self.pseudo_view_weight_init = 0.0
+        self.pseudo_view_weight_final = 0.0
+        self.pseudo_view_start_iter = 5000
+        self.pseudo_view_end_iter = 0
+        self.pseudo_view_interval = 1
+        self.pseudo_view_shift_ratio = 0.03
+        self.pseudo_view_random_sign = True
+        self.pseudo_view_mask_mode = "valid"
+        self.pseudo_view_depth_rel_thresh = 0.05
+        self.pseudo_view_min_pixels = 2048
+        self.pseudo_view_detach_ref_depth = True
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")
