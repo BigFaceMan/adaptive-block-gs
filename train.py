@@ -10,6 +10,7 @@
 #
 
 import os
+import math
 import torch
 import time
 from utils.loss_utils import l1_loss, ssim
@@ -175,6 +176,251 @@ def log_validation_depth_images(logger, tag_prefix, iteration, render_pkg, viewp
         logger.add_images(f"{tag_prefix}/inv_depth_error", error_vis[None], global_step=iteration)
 
 
+def normal_tensor_to_image(normal):
+    if normal is None:
+        return None
+    normal = normal.detach().float()
+    while normal.ndim > 3:
+        normal = normal[0]
+    if normal.ndim != 3 or normal.shape[0] < 3:
+        return None
+    return (normal[:3] * 0.5 + 0.5).clamp(0.0, 1.0).contiguous()
+
+
+def world_normal_to_camera(normal, viewpoint, sign=-1.0):
+    rotation = viewpoint.world_view_transform[:3, :3].to(device=normal.device, dtype=normal.dtype)
+    normal_cam = torch.einsum("ji,jhw->ihw", rotation, normal)
+    normal_cam = float(sign) * normal_cam
+    return torch.nn.functional.normalize(normal_cam, p=2, dim=0, eps=1e-6)
+
+
+def parse_normal_confidence_mode(mode):
+    mode = str(mode or "none").strip().lower()
+    if mode in {"", "0", "false", "none", "off", "disabled"}:
+        return mode, set()
+    if mode in {"edge", "edges"}:
+        return mode, {"edge"}
+    if mode in {"depth_normal", "depth-normal", "dn"}:
+        return mode, {"depth_normal"}
+    if mode in {"depth_normal_edge", "depth-normal-edge", "dn_edge", "dn-edge"}:
+        return mode, {"depth_normal", "edge"}
+    raise ValueError(
+        "--normal_confidence_mode must be one of: none, edge, depth_normal, depth_normal_edge"
+    )
+
+
+def parse_normal_confidence_edge_sources(sources):
+    sources = str(sources or "rgb,normal,depth").strip().lower()
+    if sources in {"", "all", "default"}:
+        return {"rgb", "normal", "depth"}
+    normalized = sources.replace("+", ",").replace("|", ",").replace(";", ",")
+    parts = {part.strip() for part in normalized.split(",") if part.strip()}
+    aliases = {
+        "image": "rgb",
+        "color": "rgb",
+        "colour": "rgb",
+        "invdepth": "depth",
+        "inverse_depth": "depth",
+        "normalmap": "normal",
+    }
+    resolved = {aliases.get(part, part) for part in parts}
+    allowed = {"rgb", "normal", "depth"}
+    unknown = resolved - allowed
+    if unknown:
+        raise ValueError(
+            "--normal_confidence_edge_sources must contain only rgb, normal, depth"
+        )
+    return resolved
+
+
+def _as_chw(tensor):
+    if tensor is None:
+        return None
+    while tensor.ndim > 3:
+        tensor = tensor[0]
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 3:
+        return None
+    return tensor
+
+
+def _gradient_magnitude_chw(tensor):
+    tensor = _as_chw(tensor)
+    if tensor is None:
+        return None
+    tensor = torch.nan_to_num(tensor.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    _, height, width = tensor.shape
+    grad = torch.zeros((1, height, width), device=tensor.device, dtype=tensor.dtype)
+    if width > 1:
+        dx = torch.linalg.norm(tensor[:, :, 1:] - tensor[:, :, :-1], dim=0, keepdim=True)
+        grad[:, :, 1:] = torch.maximum(grad[:, :, 1:], dx)
+        grad[:, :, :-1] = torch.maximum(grad[:, :, :-1], dx)
+    if height > 1:
+        dy = torch.linalg.norm(tensor[:, 1:, :] - tensor[:, :-1, :], dim=0, keepdim=True)
+        grad[:, 1:, :] = torch.maximum(grad[:, 1:, :], dy)
+        grad[:, :-1, :] = torch.maximum(grad[:, :-1, :], dy)
+    return grad
+
+
+def _robust_unit_signal(signal, valid, quantile=0.95):
+    signal = torch.nan_to_num(signal.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    valid_values = signal[valid.detach()]
+    if valid_values.numel() == 0:
+        return torch.zeros_like(signal)
+    scale = torch.quantile(valid_values, float(max(0.0, min(1.0, quantile)))).clamp_min(1e-6)
+    return (signal / scale).clamp(0.0, 1.0)
+
+
+def _edge_confidence(gt_image, gt_normal, invdepth, valid, opt):
+    edge_parts = []
+    edge_sources = parse_normal_confidence_edge_sources(
+        getattr(opt, "normal_confidence_edge_sources", "rgb,normal,depth")
+    )
+    if "rgb" in edge_sources:
+        rgb_grad = _gradient_magnitude_chw(gt_image)
+        if rgb_grad is not None and rgb_grad.shape == valid.shape:
+            edge_parts.append(_robust_unit_signal(rgb_grad, valid))
+    if "normal" in edge_sources:
+        normal_grad = _gradient_magnitude_chw(gt_normal)
+        if normal_grad is not None and normal_grad.shape == valid.shape:
+            edge_parts.append(_robust_unit_signal(normal_grad, valid))
+    if "depth" in edge_sources:
+        invdepth = _as_chw(invdepth)
+        if invdepth is not None and invdepth.shape == valid.shape:
+            depth_grad = _gradient_magnitude_chw(invdepth)
+            if depth_grad is not None:
+                edge_parts.append(_robust_unit_signal(depth_grad, valid))
+
+    if not edge_parts:
+        return valid.to(gt_normal.dtype), {"threshold": 0.0, "keep": 1.0}
+
+    edge_signal = torch.stack(edge_parts, dim=0).sum(dim=0)
+    valid_values = edge_signal[valid.detach()]
+    if valid_values.numel() == 0:
+        return torch.zeros_like(edge_signal), {"threshold": 0.0, "keep": 0.0}
+
+    edge_quantile = float(getattr(opt, "normal_confidence_edge_quantile", 0.9))
+    edge_quantile = max(0.0, min(1.0, edge_quantile))
+    threshold = torch.quantile(valid_values.detach(), edge_quantile)
+    edge = edge_signal > threshold
+
+    dilate_px = max(0, int(getattr(opt, "normal_confidence_edge_dilate_px", 3)))
+    if dilate_px > 0:
+        edge = torch.nn.functional.max_pool2d(
+            edge.float().unsqueeze(0),
+            kernel_size=2 * dilate_px + 1,
+            stride=1,
+            padding=dilate_px,
+        ).squeeze(0) > 0
+
+    edge_floor = float(getattr(opt, "normal_confidence_edge_floor", 0.0))
+    edge_floor = max(0.0, min(1.0, edge_floor))
+    confidence = torch.where(
+        edge,
+        torch.full_like(edge_signal, edge_floor),
+        torch.ones_like(edge_signal),
+    ) * valid.to(gt_normal.dtype)
+    keep = confidence.sum() / valid.to(gt_normal.dtype).sum().clamp_min(1.0)
+    return confidence, {"threshold": float(threshold.detach().item()), "keep": float(keep.detach().item())}
+
+
+def _depth_normal_confidence(gt_normal, invdepth, viewpoint, valid, opt):
+    invdepth = _as_chw(invdepth)
+    if invdepth is None or invdepth.shape != valid.shape:
+        return torch.zeros_like(valid, dtype=gt_normal.dtype), {"available": 0.0, "mean": 0.0}
+
+    invdepth = invdepth.to(device=gt_normal.device, dtype=gt_normal.dtype, non_blocking=True)
+    invdepth = torch.nan_to_num(invdepth, nan=0.0, posinf=0.0, neginf=0.0)
+    _, height, width = invdepth.shape
+    if height < 3 or width < 3:
+        return torch.zeros_like(valid, dtype=gt_normal.dtype), {"available": 0.0, "mean": 0.0}
+
+    depth_valid = valid & torch.isfinite(invdepth) & (invdepth > 1e-6)
+    z = torch.where(depth_valid, 1.0 / invdepth.clamp_min(1e-6), torch.zeros_like(invdepth))
+    fx = 0.5 * float(width) / math.tan(float(viewpoint.FoVx) * 0.5)
+    fy = 0.5 * float(height) / math.tan(float(viewpoint.FoVy) * 0.5)
+    cx = 0.5 * float(width - 1)
+    cy = 0.5 * float(height - 1)
+    u = torch.arange(width, device=gt_normal.device, dtype=gt_normal.dtype).view(1, 1, width)
+    v = torch.arange(height, device=gt_normal.device, dtype=gt_normal.dtype).view(1, height, 1)
+    points = torch.cat(((u - cx) / fx * z, (v - cy) / fy * z, z), dim=0)
+
+    dx = points[:, 1:-1, 2:] - points[:, 1:-1, :-2]
+    dy = points[:, 2:, 1:-1] - points[:, :-2, 1:-1]
+    normal_inner = torch.cross(dx.permute(1, 2, 0), dy.permute(1, 2, 0), dim=-1).permute(2, 0, 1)
+    normal_inner = torch.nn.functional.normalize(normal_inner, p=2, dim=0, eps=1e-6)
+    inner_valid = (
+        depth_valid[:, 1:-1, 1:-1]
+        & depth_valid[:, 1:-1, 2:]
+        & depth_valid[:, 1:-1, :-2]
+        & depth_valid[:, 2:, 1:-1]
+        & depth_valid[:, :-2, 1:-1]
+        & torch.isfinite(normal_inner).all(dim=0, keepdim=True)
+    )
+
+    depth_normal = torch.zeros_like(gt_normal)
+    depth_normal[:, 1:-1, 1:-1] = normal_inner
+    confidence_valid = torch.zeros_like(valid)
+    confidence_valid[:, 1:-1, 1:-1] = inner_valid
+    valid_float = confidence_valid.to(gt_normal.dtype)
+    dot = (depth_normal * gt_normal).sum(dim=0, keepdim=True).clamp(-1.0, 1.0)
+    mean_dot = (dot * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+    if mean_dot.detach() < 0:
+        dot = -dot
+
+    angle_deg = float(getattr(opt, "normal_confidence_depth_angle_deg", 45.0))
+    cos_min = math.cos(math.radians(max(0.0, min(89.0, angle_deg))))
+    depth_floor = float(getattr(opt, "normal_confidence_depth_floor", 0.0))
+    depth_floor = max(0.0, min(1.0, depth_floor))
+    confidence = ((dot - cos_min) / max(1.0 - cos_min, 1e-6)).clamp(0.0, 1.0)
+    if depth_floor > 0.0:
+        confidence = confidence * (1.0 - depth_floor) + depth_floor
+    confidence = confidence * valid_float
+    mean_conf = confidence.sum() / valid_float.sum().clamp_min(1.0)
+    return confidence, {"available": 1.0, "mean": float(mean_conf.detach().item())}
+
+
+def compute_normal_confidence(gt_normal, gt_image, viewpoint, valid, mode_parts, opt):
+    confidence = valid.to(gt_normal.dtype)
+    stats = {
+        "depth_available": 0.0,
+        "depth_mean": 0.0,
+        "edge_threshold": 0.0,
+        "edge_keep": 1.0,
+    }
+    invdepth = getattr(viewpoint, "invdepthmap", None)
+    if invdepth is not None:
+        invdepth = invdepth.to(device=gt_normal.device, dtype=gt_normal.dtype, non_blocking=True)
+
+    if "depth_normal" in mode_parts:
+        if not bool(getattr(viewpoint, "depth_reliable", False)):
+            confidence = torch.zeros_like(confidence)
+        else:
+            depth_conf, depth_stats = _depth_normal_confidence(gt_normal, invdepth, viewpoint, valid, opt)
+            confidence = confidence * depth_conf
+            stats["depth_available"] = depth_stats["available"]
+            stats["depth_mean"] = depth_stats["mean"]
+
+    if "edge" in mode_parts:
+        edge_conf, edge_stats = _edge_confidence(gt_image, gt_normal, invdepth, valid, opt)
+        confidence = confidence * edge_conf
+        stats["edge_threshold"] = edge_stats["threshold"]
+        stats["edge_keep"] = edge_stats["keep"]
+
+    min_confidence = float(getattr(opt, "normal_confidence_min", 0.0))
+    if min_confidence > 0.0:
+        confidence = torch.where(confidence >= min_confidence, confidence, torch.zeros_like(confidence))
+
+    confidence = confidence.detach() * valid.to(gt_normal.dtype)
+    valid_float = valid.to(gt_normal.dtype)
+    stats["sum"] = float(confidence.sum().detach().item())
+    stats["pixels"] = float((confidence > 0).to(gt_normal.dtype).sum().detach().item())
+    stats["mean"] = float((confidence.sum() / valid_float.sum().clamp_min(1.0)).detach().item())
+    stats["coverage"] = stats["pixels"] / max(float(valid.numel()), 1.0)
+    return confidence, stats
+
+
 def estimate_camera_sample_cuda_bytes(viewpoint):
     if viewpoint is None:
         return 0
@@ -185,6 +431,8 @@ def estimate_camera_sample_cuda_bytes(viewpoint):
         "alpha_mask",
         "invdepthmap",
         "depth_mask",
+        "normalmap",
+        "normal_mask",
         "world_view_transform",
         "projection_matrix",
         "full_proj_transform",
@@ -255,6 +503,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    normal_weight_init = float(getattr(opt, "normal_weight_init", 0.0))
+    normal_weight_final = float(getattr(opt, "normal_weight_final", 0.0))
+    normal_start_iter = max(0, int(getattr(opt, "normal_start_iter", 0)))
+    normal_confidence_mode, normal_confidence_parts = parse_normal_confidence_mode(
+        getattr(opt, "normal_confidence_mode", "none")
+    )
+    normal_weight_max_steps = opt.iterations if normal_start_iter <= 0 else max(1, opt.iterations - normal_start_iter + 1)
+    if normal_weight_init > 0.0 and normal_weight_final > 0.0:
+        normal_weight = get_expon_lr_func(normal_weight_init, normal_weight_final, max_steps=normal_weight_max_steps)
+    else:
+        normal_weight_constant = max(normal_weight_init, normal_weight_final)
+        normal_weight = lambda _step: normal_weight_constant
     depth_mask_mode = getattr(opt, "depth_reg_mask_mode", "full") or "full"
     if depth_mask_mode not in {"full", "block_projection"}:
         raise ValueError("--depth_reg_mask_mode must be 'full' or 'block_projection'")
@@ -304,6 +564,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     auto_cache_done = False
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_Lnormal_for_log = 0.0
     ema_time_render = 0.0
     ema_time_loss = 0.0
     ema_time_densify = 0.0
@@ -334,7 +595,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
             start = time.time()
-            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            normal_active = iteration >= normal_start_iter
+            if normal_active:
+                normal_weight_step = iteration if normal_start_iter <= 0 else iteration - normal_start_iter + 1
+                normal_weight_value = normal_weight(normal_weight_step)
+            else:
+                normal_weight_value = 0.0
+            render_normal = (
+                normal_weight_value > 0
+                and bool(getattr(viewpoint_cam, "normal_reliable", False))
+                and getattr(viewpoint_cam, "normalmap", None) is not None
+            )
+            render_pkg = render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                bg,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+                return_normal=render_normal,
+            )
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             end = time.time()
             ema_time_render = 0.4 * (end - start) + 0.6 * ema_time_render
@@ -431,6 +711,136 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "time_depth_mask_transfer": depth_mask_transfer_time,
             }
 
+            # Normal regularization
+            normal_reg_enabled = normal_weight_value > 0
+            normal_reliable = bool(getattr(viewpoint_cam, "normal_reliable", False))
+            Lnormal = 0
+            Lnormal_pure_item = 0.0
+            normal_mask_pixels = 0.0
+            normal_mask_coverage = 0.0
+            normal_base_mask_pixels = 0.0
+            normal_confidence_sum = 0.0
+            normal_confidence_mean = 1.0
+            normal_confidence_pixels = 0.0
+            normal_confidence_coverage = 0.0
+            normal_confidence_depth_available = 0.0
+            normal_confidence_depth_mean = 0.0
+            normal_confidence_edge_threshold = 0.0
+            normal_confidence_edge_keep = 1.0
+            normal_mask_enough = True
+            normal_reg_time = 0.0
+            normal_reg_start = time.time()
+            if render_normal and "normal" in render_pkg:
+                rendered_normal = render_pkg["normal"]
+                gt_normal = viewpoint_cam.normalmap.to("cuda", non_blocking=True).float()
+                gt_normal = torch.nan_to_num(gt_normal, nan=0.0, posinf=0.0, neginf=0.0)
+                gt_norm = torch.linalg.norm(gt_normal, dim=0, keepdim=True)
+                valid = torch.isfinite(gt_normal).all(dim=0, keepdim=True) & (gt_norm > 0.5)
+
+                if viewpoint_cam.normal_mask is not None:
+                    normal_mask = viewpoint_cam.normal_mask.to("cuda", non_blocking=True).float()
+                    while normal_mask.ndim > 3:
+                        normal_mask = normal_mask[0]
+                    if normal_mask.ndim == 2:
+                        normal_mask = normal_mask.unsqueeze(0)
+                    if normal_mask.ndim == 3 and normal_mask.shape[0] != 1:
+                        normal_mask = normal_mask[:1]
+                    if normal_mask.shape == valid.shape:
+                        valid = valid & (normal_mask > 0)
+
+                rendered_alpha = render_pkg.get("alpha")
+                if rendered_alpha is not None:
+                    valid = valid & (rendered_alpha.detach() > float(getattr(opt, "normal_alpha_min", 0.001)))
+
+                valid_float = valid.to(gt_normal.dtype)
+                valid_pixels = valid_float.sum()
+                normal_base_mask_pixels = float(valid_pixels.detach().item())
+                normal_confidence = valid_float
+                normal_confidence_denom = valid_pixels
+                normal_confidence_pixels = normal_base_mask_pixels
+                normal_confidence_sum = normal_base_mask_pixels
+                normal_confidence_coverage = normal_confidence_pixels / max(float(valid_float.numel()), 1.0)
+                normal_confidence_mean = 1.0 if normal_base_mask_pixels > 0 else 0.0
+
+                gt_normal = torch.nn.functional.normalize(gt_normal, p=2, dim=0, eps=1e-6)
+                if normal_base_mask_pixels > 0 and normal_confidence_parts:
+                    confidence_stats = {}
+                    normal_confidence, confidence_stats = compute_normal_confidence(
+                        gt_normal,
+                        gt_image,
+                        viewpoint_cam,
+                        valid,
+                        normal_confidence_parts,
+                        opt,
+                    )
+                    normal_confidence_denom = normal_confidence.sum()
+                    normal_confidence_sum = float(normal_confidence_denom.detach().item())
+                    normal_confidence_pixels = float(
+                        (normal_confidence > 0).to(gt_normal.dtype).sum().detach().item()
+                    )
+                    normal_confidence_coverage = normal_confidence_pixels / max(float(valid_float.numel()), 1.0)
+                    normal_confidence_mean = confidence_stats.get("mean", 0.0)
+                    normal_confidence_depth_available = confidence_stats.get("depth_available", 0.0)
+                    normal_confidence_depth_mean = confidence_stats.get("depth_mean", 0.0)
+                    normal_confidence_edge_threshold = confidence_stats.get("edge_threshold", 0.0)
+                    normal_confidence_edge_keep = confidence_stats.get("edge_keep", 1.0)
+
+                normal_mask_pixels = normal_confidence_pixels if normal_confidence_parts else normal_base_mask_pixels
+                normal_mask_coverage = normal_mask_pixels / max(float(valid_float.numel()), 1.0)
+                min_normal_pixels = float(getattr(opt, "normal_min_pixels", 0))
+                normal_mask_enough = (
+                    normal_mask_pixels >= min_normal_pixels
+                    and normal_mask_pixels > 0
+                    and float(normal_confidence_denom.detach().item()) > 0.0
+                )
+
+                if normal_mask_enough:
+                    pred_normal = world_normal_to_camera(
+                        rendered_normal,
+                        viewpoint_cam,
+                        sign=getattr(opt, "normal_sign", -1.0),
+                    )
+                    normal_dot = (pred_normal * gt_normal).sum(dim=0, keepdim=True).clamp(-1.0, 1.0)
+                    normal_error = 1.0 - normal_dot
+                    Lnormal_pure = (normal_error * normal_confidence).sum() / normal_confidence_denom.clamp_min(1.0)
+                    Lnormal_tensor = normal_weight_value * Lnormal_pure
+                    loss += Lnormal_tensor
+                    Lnormal_pure_item = Lnormal_pure.item()
+                    Lnormal = Lnormal_tensor.item()
+                normal_reg_time = time.time() - normal_reg_start
+            normal_stats = {
+                "enabled": normal_reg_enabled,
+                "applied": render_normal and normal_mask_enough,
+                "reliable": normal_reliable,
+                "loss": Lnormal,
+                "loss_pure": Lnormal_pure_item,
+                "weight": normal_weight_value,
+                "mask_pixels": normal_mask_pixels,
+                "mask_coverage": normal_mask_coverage,
+                "base_mask_pixels": normal_base_mask_pixels,
+                "mask_enough": normal_mask_enough,
+                "alpha_min": float(getattr(opt, "normal_alpha_min", 0.001)),
+                "sign": float(getattr(opt, "normal_sign", -1.0)),
+                "start_iter": normal_start_iter,
+                "confidence_mode": normal_confidence_mode,
+                "confidence_enabled": bool(normal_confidence_parts),
+                "confidence_sum": normal_confidence_sum,
+                "confidence_mean": normal_confidence_mean,
+                "confidence_pixels": normal_confidence_pixels,
+                "confidence_coverage": normal_confidence_coverage,
+                "confidence_depth_available": normal_confidence_depth_available,
+                "confidence_depth_mean": normal_confidence_depth_mean,
+                "confidence_edge_threshold": normal_confidence_edge_threshold,
+                "confidence_edge_keep": normal_confidence_edge_keep,
+                "confidence_depth_angle_deg": float(getattr(opt, "normal_confidence_depth_angle_deg", 45.0)),
+                "confidence_edge_quantile": float(getattr(opt, "normal_confidence_edge_quantile", 0.9)),
+                "confidence_edge_dilate_px": int(getattr(opt, "normal_confidence_edge_dilate_px", 3)),
+                "confidence_edge_floor": float(getattr(opt, "normal_confidence_edge_floor", 0.0)),
+                "confidence_depth_floor": float(getattr(opt, "normal_confidence_depth_floor", 0.0)),
+                "confidence_min": float(getattr(opt, "normal_confidence_min", 0.0)),
+                "time_normal_reg": normal_reg_time,
+            }
+
             loss.backward()
             end = time.time()
             ema_time_loss = 0.4 * (end - start) + 0.6 * ema_time_loss
@@ -441,9 +851,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Progress bar
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+                ema_Lnormal_for_log = 0.4 * Lnormal + 0.6 * ema_Lnormal_for_log
 
                 if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                    progress_bar.set_postfix({
+                        "Loss": f"{ema_loss_for_log:.{7}f}",
+                        "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
+                        "Normal Loss": f"{ema_Lnormal_for_log:.{7}f}",
+                    })
                     progress_bar.update(10)
                 if iteration == opt.iterations:
                     progress_bar.close()
@@ -459,7 +874,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 }
 
                 # Log and save
-                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset, depth_stats)
+                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset, depth_stats, normal_stats)
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
@@ -472,6 +887,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        torch.cuda.empty_cache()
                         points_before = gaussians.get_xyz.shape[0]
                         allocated_before = torch.cuda.memory_allocated()
                         reserved_before = torch.cuda.memory_reserved()
@@ -636,7 +1052,7 @@ def log_training_observations(logger, iteration, gaussians, radii, visibility_fi
         group_name = group.get("name", "unknown")
         logger.add_scalar(f"optimizer/lr_{group_name}", group["lr"], iteration)
 
-def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None):
+def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None, normal_stats=None):
     if logger and iteration % 10 == 0:
         logger.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         logger.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -654,6 +1070,35 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
             logger.add_scalar('train_time/depth_reg', depth_stats["time_depth_reg"], iteration)
             logger.add_scalar('train_time/depth_mask_project', depth_stats["time_depth_mask_project"], iteration)
             logger.add_scalar('train_time/depth_mask_transfer', depth_stats["time_depth_mask_transfer"], iteration)
+        if normal_stats and normal_stats.get("enabled", False):
+            logger.add_scalar('train_loss_patches/normal_loss', normal_stats["loss"], iteration)
+            logger.add_scalar('train_loss_patches/normal_loss_pure', normal_stats["loss_pure"], iteration)
+            logger.add_scalar('train_loss_patches/normal_weight', normal_stats["weight"], iteration)
+            logger.add_scalar('train_loss_patches/normal_reliable', float(normal_stats["reliable"]), iteration)
+            logger.add_scalar('train_loss_patches/normal_applied', float(normal_stats["applied"]), iteration)
+            logger.add_scalar('train_loss_patches/normal_mask_enough', float(normal_stats["mask_enough"]), iteration)
+            logger.add_scalar('train_loss_patches/normal_mask_pixels', normal_stats["mask_pixels"], iteration)
+            logger.add_scalar('train_loss_patches/normal_mask_coverage', normal_stats["mask_coverage"], iteration)
+            logger.add_scalar('train_loss_patches/normal_base_mask_pixels', normal_stats["base_mask_pixels"], iteration)
+            logger.add_scalar('train_loss_patches/normal_alpha_min', normal_stats["alpha_min"], iteration)
+            logger.add_scalar('train_loss_patches/normal_sign', normal_stats["sign"], iteration)
+            logger.add_scalar('train_loss_patches/normal_start_iter', normal_stats["start_iter"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_enabled', float(normal_stats["confidence_enabled"]), iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_sum', normal_stats["confidence_sum"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_mean', normal_stats["confidence_mean"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_pixels', normal_stats["confidence_pixels"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_coverage', normal_stats["confidence_coverage"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_depth_available', normal_stats["confidence_depth_available"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_depth_mean', normal_stats["confidence_depth_mean"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_edge_threshold', normal_stats["confidence_edge_threshold"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_edge_keep', normal_stats["confidence_edge_keep"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_depth_angle_deg', normal_stats["confidence_depth_angle_deg"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_edge_quantile', normal_stats["confidence_edge_quantile"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_edge_dilate_px', normal_stats["confidence_edge_dilate_px"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_edge_floor', normal_stats["confidence_edge_floor"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_depth_floor', normal_stats["confidence_depth_floor"], iteration)
+            logger.add_scalar('train_loss_patches/normal_confidence_min', normal_stats["confidence_min"], iteration)
+            logger.add_scalar('train_time/normal_reg', normal_stats["time_normal_reg"], iteration)
         logger.add_scalar('train_time/render', ema_time["render"], iteration)
         logger.add_scalar('train_time/loss', ema_time["loss"], iteration)
         logger.add_scalar('train_time/densify', ema_time["densify"], iteration)

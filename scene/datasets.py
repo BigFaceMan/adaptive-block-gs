@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 
+import os
+
 import cv2
 import numpy as np
 import torch
@@ -29,6 +31,9 @@ class GSCameraSample:
         invdepthmap,
         depth_mask,
         depth_reliable,
+        normalmap,
+        normal_mask,
+        normal_reliable,
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
     ):
@@ -44,6 +49,9 @@ class GSCameraSample:
         self.invdepthmap = invdepthmap
         self.depth_mask = depth_mask
         self.depth_reliable = depth_reliable
+        self.normalmap = normalmap
+        self.normal_mask = normal_mask
+        self.normal_reliable = normal_reliable
 
         self.image_width = resolution[0]
         self.image_height = resolution[1]
@@ -70,6 +78,9 @@ class GSCameraSample:
         self.invdepthmap = None
         self.depth_mask = None
         self.depth_reliable = False
+        self.normalmap = None
+        self.normal_mask = None
+        self.normal_reliable = False
 
 
 def _read_invdepth(depth_path, is_nerf_synthetic):
@@ -88,6 +99,63 @@ def _read_invdepth(depth_path, is_nerf_synthetic):
     except Exception as e:
         print(f"An unexpected error occurred when trying to read depth at {depth_path}: {e}")
         raise
+
+
+def _normal_path_candidates(normal_path):
+    if not normal_path:
+        return []
+    candidates = [normal_path]
+    root, ext = os.path.splitext(normal_path)
+    if ext.lower() != ".npy":
+        candidates.append(root + ".npy")
+    for image_ext in (".png", ".jpg", ".jpeg"):
+        candidates.append(root + image_ext)
+    deduped = []
+    seen = set()
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            deduped.append(path)
+    return deduped
+
+
+def _normal_to_chw(array, encoded_image=False):
+    normal = np.asarray(array)
+    if normal.ndim != 3:
+        raise ValueError(f"Expected normal map with 3 dimensions, got shape={normal.shape}")
+
+    if normal.shape[0] == 3 and normal.shape[-1] != 3:
+        normal = normal.astype(np.float32, copy=False)
+    elif normal.shape[-1] >= 3:
+        normal = np.transpose(normal[..., :3], (2, 0, 1)).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Expected normal map with 3 channels, got shape={normal.shape}")
+
+    finite = np.isfinite(normal)
+    normal = np.where(finite, normal, 0.0).astype(np.float32, copy=False)
+    if encoded_image and normal.size and normal.max() > 2.0:
+        normal = normal / 255.0 * 2.0 - 1.0
+    elif encoded_image and normal.size and normal.min() >= 0.0 and normal.max() <= 1.0:
+        normal = normal * 2.0 - 1.0
+    return normal
+
+
+def _normalize_normal_chw(normal):
+    norm = np.linalg.norm(normal, axis=0, keepdims=True)
+    valid = np.isfinite(norm) & (norm > 1e-6)
+    normal = np.divide(normal, np.maximum(norm, 1e-6), where=valid, out=np.zeros_like(normal, dtype=np.float32))
+    return normal.astype(np.float32, copy=False), valid.astype(np.float32, copy=False)
+
+
+def _read_normal(normal_path):
+    for path in _normal_path_candidates(normal_path):
+        if not os.path.exists(path):
+            continue
+        if path.lower().endswith(".npy"):
+            return _normal_to_chw(np.load(path))
+        with Image.open(path) as image:
+            return _normal_to_chw(np.asarray(image.convert("RGB")), encoded_image=True)
+    raise FileNotFoundError(f"Normal map not found for path '{normal_path}'")
 
 
 def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset, image_cache=None):
@@ -158,6 +226,27 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
             raw_invdepthmap = raw_invdepthmap[..., 0]
         invdepthmap = torch.from_numpy(raw_invdepthmap[None]).to(data_device)
 
+    normalmap = None
+    normal_mask = None
+    normal_reliable = False
+    raw_normalmap = None
+    if image_cache is not None:
+        normalmap = image_cache.normal_tensor(cam_info.image_name)
+        normal_reliable = image_cache.normal_reliable(cam_info.image_name)
+    normal_path = getattr(cam_info, "normal_path", "")
+    if normalmap is None and normal_path:
+        raw_normalmap = _read_normal(normal_path)
+
+    if raw_normalmap is not None:
+        if raw_normalmap.shape[-2:] != (resolution[1], resolution[0]):
+            normal_hwc = np.transpose(raw_normalmap, (1, 2, 0))
+            normal_hwc = cv2.resize(normal_hwc, resolution, interpolation=cv2.INTER_LINEAR)
+            raw_normalmap = np.transpose(normal_hwc, (2, 0, 1))
+        raw_normalmap, raw_normal_mask = _normalize_normal_chw(raw_normalmap)
+        normalmap = torch.from_numpy(raw_normalmap).to(data_device)
+        normal_mask = torch.from_numpy(raw_normal_mask).to(data_device)
+        normal_reliable = True
+
     return GSCameraSample(
         resolution,
         colmap_id=cam_info.uid,
@@ -172,6 +261,9 @@ def load_camera_sample(args, idx, cam_info, resolution_scale, is_nerf_synthetic,
         invdepthmap=invdepthmap,
         depth_mask=depth_mask,
         depth_reliable=depth_reliable,
+        normalmap=normalmap,
+        normal_mask=normal_mask,
+        normal_reliable=normal_reliable,
     )
 
 

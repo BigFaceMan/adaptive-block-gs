@@ -51,9 +51,11 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        self._normals = ""
         self.test_source_path = ""
         self.test_images = ""
         self.test_depths = ""
+        self.test_normals = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
@@ -140,6 +142,20 @@ class OptimizationParams(ParamGroup):
         self.depth_reg_mask_max_points = 100000
         self.depth_reg_mask_cache = True
         self.depth_reg_mask_cache_max_items = 0
+        self.normal_weight_init = 0.0
+        self.normal_weight_final = 0.0
+        self.normal_start_iter = 0
+        self.normal_alpha_min = 0.001
+        self.normal_min_pixels = 2048
+        self.normal_sign = -1.0
+        self.normal_confidence_mode = "none"
+        self.normal_confidence_depth_angle_deg = 45.0
+        self.normal_confidence_edge_quantile = 0.9
+        self.normal_confidence_edge_dilate_px = 3
+        self.normal_confidence_edge_sources = "rgb,normal,depth"
+        self.normal_confidence_edge_floor = 0.0
+        self.normal_confidence_depth_floor = 0.0
+        self.normal_confidence_min = 0.0
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")
