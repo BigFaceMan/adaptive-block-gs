@@ -43,6 +43,54 @@ def _camera_focal(camera):
     return fx, fy
 
 
+def _project_ref_to_pseudo(ref_camera, pseudo_camera, ref_invdepth, detach_ref_depth=True):
+    ref_invdepth = _single_channel(ref_invdepth)
+    if detach_ref_depth:
+        ref_invdepth = ref_invdepth.detach()
+
+    device = ref_invdepth.device
+    dtype = ref_invdepth.dtype
+    _, height, width = ref_invdepth.shape
+    fx, fy = _camera_focal(ref_camera)
+    cx = (width - 1) * 0.5
+    cy = (height - 1) * 0.5
+
+    ys, xs = torch.meshgrid(
+        torch.arange(height, device=device, dtype=dtype),
+        torch.arange(width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    ref_inv = ref_invdepth.squeeze(0)
+    ref_valid = torch.isfinite(ref_inv) & (ref_inv > 1e-8)
+    safe_ref_inv = torch.where(ref_valid, ref_inv, torch.ones_like(ref_inv))
+    ref_depth = 1.0 / safe_ref_inv.clamp_min(1e-8)
+
+    x_cam = (xs - cx) * ref_depth / fx
+    y_cam = (ys - cy) * ref_depth / fy
+    ref_points = torch.stack((x_cam, y_cam, ref_depth), dim=-1).view(-1, 3)
+
+    ref_R, ref_T = _as_rt(ref_camera, device, dtype)
+    pseudo_R, pseudo_T = _as_rt(pseudo_camera, device, dtype)
+    world_points = (ref_points - ref_T) @ ref_R.transpose(0, 1)
+    pseudo_points = world_points @ pseudo_R + pseudo_T
+
+    pseudo_z = pseudo_points[:, 2].view(height, width)
+    pseudo_x = pseudo_points[:, 0].view(height, width)
+    pseudo_y = pseudo_points[:, 1].view(height, width)
+    u = fx * (pseudo_x / pseudo_z.clamp_min(1e-8)) + cx
+    v = fy * (pseudo_y / pseudo_z.clamp_min(1e-8)) + cy
+    inside = (pseudo_z > 1e-8) & (u >= 0) & (u <= width - 1) & (v >= 0) & (v <= height - 1)
+
+    grid = torch.stack(
+        (
+            2.0 * u / max(width - 1, 1) - 1.0,
+            2.0 * v / max(height - 1, 1) - 1.0,
+        ),
+        dim=-1,
+    ).unsqueeze(0)
+    return grid, ref_valid & inside, pseudo_z
+
+
 def make_pseudo_view_camera(
     ref_camera,
     ref_invdepth,
@@ -119,52 +167,15 @@ def pseudo_view_reprojection_loss(
     min_pixels=2048,
     detach_ref_depth=True,
 ):
-    ref_invdepth = _single_channel(ref_invdepth)
     pseudo_invdepth = _single_channel(pseudo_invdepth)
-    if detach_ref_depth:
-        ref_invdepth = ref_invdepth.detach()
     pseudo_invdepth_for_mask = pseudo_invdepth.detach()
 
-    device = ref_invdepth.device
-    dtype = ref_invdepth.dtype
-    _, height, width = ref_invdepth.shape
-    fx, fy = _camera_focal(ref_camera)
-    cx = (width - 1) * 0.5
-    cy = (height - 1) * 0.5
-
-    ys, xs = torch.meshgrid(
-        torch.arange(height, device=device, dtype=dtype),
-        torch.arange(width, device=device, dtype=dtype),
-        indexing="ij",
+    grid, mask, pseudo_z = _project_ref_to_pseudo(
+        ref_camera,
+        pseudo_camera,
+        ref_invdepth,
+        detach_ref_depth=detach_ref_depth,
     )
-    ref_inv = ref_invdepth.squeeze(0)
-    ref_valid = torch.isfinite(ref_inv) & (ref_inv > 1e-8)
-    safe_ref_inv = torch.where(ref_valid, ref_inv, torch.ones_like(ref_inv))
-    ref_depth = 1.0 / safe_ref_inv.clamp_min(1e-8)
-
-    x_cam = (xs - cx) * ref_depth / fx
-    y_cam = (ys - cy) * ref_depth / fy
-    ref_points = torch.stack((x_cam, y_cam, ref_depth), dim=-1).view(-1, 3)
-
-    ref_R, ref_T = _as_rt(ref_camera, device, dtype)
-    pseudo_R, pseudo_T = _as_rt(pseudo_camera, device, dtype)
-    world_points = (ref_points - ref_T) @ ref_R.transpose(0, 1)
-    pseudo_points = world_points @ pseudo_R + pseudo_T
-
-    pseudo_z = pseudo_points[:, 2].view(height, width)
-    pseudo_x = pseudo_points[:, 0].view(height, width)
-    pseudo_y = pseudo_points[:, 1].view(height, width)
-    u = fx * (pseudo_x / pseudo_z.clamp_min(1e-8)) + cx
-    v = fy * (pseudo_y / pseudo_z.clamp_min(1e-8)) + cy
-    inside = (pseudo_z > 1e-8) & (u >= 0) & (u <= width - 1) & (v >= 0) & (v <= height - 1)
-
-    grid = torch.stack(
-        (
-            2.0 * u / max(width - 1, 1) - 1.0,
-            2.0 * v / max(height - 1, 1) - 1.0,
-        ),
-        dim=-1,
-    ).unsqueeze(0)
     warped_image = F.grid_sample(
         pseudo_image.unsqueeze(0),
         grid,
@@ -180,7 +191,6 @@ def pseudo_view_reprojection_loss(
         align_corners=True,
     ).squeeze(0)
 
-    mask = ref_valid & inside
     if mask_mode == "depth_consistent":
         warped_depth = 1.0 / warped_invdepth.squeeze(0).clamp_min(1e-8)
         rel_error = torch.abs(warped_depth - pseudo_z) / pseudo_z.clamp_min(1e-8)
@@ -201,3 +211,60 @@ def pseudo_view_reprojection_loss(
     image_mask = mask.expand_as(warped_image)
     loss = (torch.abs(warped_image - gt_image) * image_mask).sum() / image_mask.sum().clamp_min(1.0)
     return loss, stats
+
+
+def warp_pseudo_normal_to_ref(
+    ref_camera,
+    pseudo_camera,
+    ref_invdepth,
+    pseudo_normal,
+    pseudo_alpha,
+    normal_valid,
+    ref_valid_mask=None,
+    alpha_min=0.01,
+    min_pixels=2048,
+    detach_ref_depth=True,
+):
+    grid, mask, _ = _project_ref_to_pseudo(
+        ref_camera,
+        pseudo_camera,
+        ref_invdepth,
+        detach_ref_depth=detach_ref_depth,
+    )
+    warped_normal = F.grid_sample(
+        pseudo_normal.unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).squeeze(0)
+    warped_alpha = F.grid_sample(
+        _single_channel(pseudo_alpha.detach()).unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).squeeze(0)
+
+    if ref_valid_mask is not None:
+        ref_valid_mask = _single_channel(ref_valid_mask).squeeze(0).to(device=mask.device)
+        mask = mask & ref_valid_mask.bool()
+    if normal_valid is not None:
+        normal_valid = _single_channel(normal_valid).squeeze(0).to(device=mask.device)
+        mask = mask & normal_valid.bool()
+    normal_norm = torch.linalg.norm(warped_normal, dim=0, keepdim=True)
+    mask = mask & (warped_alpha.squeeze(0) > float(alpha_min))
+    mask = mask & torch.isfinite(warped_normal).all(dim=0) & (normal_norm.squeeze(0) > 1e-6)
+
+    mask = mask.unsqueeze(0).to(dtype=warped_normal.dtype)
+    mask_pixels = float(mask.sum().detach().item())
+    stats = {
+        "mask_pixels": mask_pixels,
+        "mask_coverage": mask_pixels / max(float(mask.numel()), 1.0),
+        "mask_enough": mask_pixels >= float(min_pixels),
+    }
+    if not stats["mask_enough"]:
+        return None, mask, stats
+
+    warped_normal = F.normalize(warped_normal, p=2, dim=0, eps=1e-6)
+    return warped_normal, mask, stats
