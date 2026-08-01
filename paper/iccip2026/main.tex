@@ -1,0 +1,441 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{url}
+
+% Use decimal hierarchical heading numbers instead of IEEEtran's
+% Roman section numbers and alphabetic subsection numbers.
+\renewcommand{\thesection}{\arabic{section}}
+\renewcommand{\thesubsection}{\thesection.\arabic{subsection}}
+\renewcommand{\thesubsubsection}{\thesubsection.\arabic{subsubsection}}
+\renewcommand{\theparagraph}{\thesubsubsection.\arabic{paragraph}}
+\renewcommand{\thesectiondis}{\thesection}
+\renewcommand{\thesubsectiondis}{\thesubsection}
+\renewcommand{\thesubsubsectiondis}{\thesubsubsection}
+\renewcommand{\theparagraphdis}{\theparagraph}
+
+\newcommand{\TBD}{\textbf{TBD}}
+\newcommand{\method}{Adaptive-Block-GS}
+
+\begin{document}
+
+\title{Adaptive-Block-GS: Importance-Balanced Reconstruction for Large-Scale 3D Gaussian Splatting}
+
+\author{\IEEEauthorblockN{Anonymous Authors}
+\IEEEauthorblockA{Paper under preparation for ICCIP 2026\\
+Author names, affiliations, and contact information: \TBD}}
+
+\maketitle
+
+\begin{abstract}
+Large-scale novel-view synthesis and reconstruction are important for urban modeling, aerial inspection, and digital twins, but they impose substantially greater representation and optimization costs than object-scale settings. Although 3D Gaussian Splatting (3DGS) offers an explicit representation and fast rendering, its Gaussian count, memory demand, and training imbalance grow rapidly in city-, campus-, and aerial-scale scenes. Existing partitioned, hierarchical, and distributed methods improve scalability, yet fixed or poorly adapted partitions may assign blocks with very different complexity, RGB-only block optimization can produce unreliable geometry in weakly constrained regions, and directly merged blocks are generally not globally coordinated. We present Adaptive-Block-GS, a block-wise framework with three corresponding components. Importance-Guided Recursive Partitioning uses a coarse Gaussian importance field to adapt split decisions and selects supervising cameras through projection-based coarse screening followed by render-difference fine screening. Dual-Confidence Gated Depth Regularization applies aligned monocular depth only where the prior is cross-view consistent and the current Gaussian geometry is uncertain. Boundary-Constrained Attribute-Wise Global Fine-Tuning optimizes all attributes near block boundaries while restricting interior updates to appearance and opacity. We evaluate the framework on six scenes from MatrixCity, Mill19, and UrbanScene3D against 3DGS, VastGS, CityGS, Octree-GS, and Grendel-GS in terms of reconstruction quality, peak GPU memory, and training time.
+% TODO(result): Our method improves PSNR by TBD dB while reducing training time and peak memory by TBD and TBD, respectively.
+\end{abstract}
+
+\begin{IEEEkeywords}
+3D Gaussian Splatting, large-scale reconstruction, novel-view synthesis, adaptive partitioning, geometry regularization
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Novel-view synthesis seeks a scene representation that can reproduce unobserved views from calibrated images. Classical image-based rendering interpolates densely captured rays or blends source images using proxy geometry \cite{levoy1996light,gortler1996lumigraph}, often reconstructed by structure-from-motion and multiview stereo systems such as COLMAP \cite{schonberger2016colmap}. Neural Radiance Fields (NeRFs) introduced continuous neural volumetric rendering and substantially improved view synthesis from sparse posed images \cite{mildenhall2020nerf}. Subsequent work accelerated optimization and rendering through multiscale sampling, sparse neural volumes, compact voxel fields, factorized tensors, and hash encodings \cite{barron2022mipnerf360,liu2020nsvf,reiser2021kilonerf,sun2022dvgo,chen2022tensorf,fridovichkeil2022plenoxels,muller2022instantngp}. More recently, 3D Gaussian Splatting (3DGS) replaced repeated neural-field queries with an explicit set of anisotropic Gaussian primitives and differentiable rasterization, enabling high-quality real-time rendering after optimization \cite{kerbl2023gaussiansplatting}.
+
+Scaling this representation to urban, campus, and aerial scenes exposes three coupled problems. First, the large spatial extent and nonuniform content make fixed or poorly adapted partitions assign blocks with very different Gaussian complexity. The resulting load imbalance can increase training time and leave difficult blocks under-optimized. Second, independently training each block only with RGB reconstruction loss can overfit the assigned views, especially in weakly textured or sparsely observed regions, producing floating primitives and inaccurate geometry. Third, direct concatenation of independently converged blocks is not a global optimum, but unconstrained full-scene retraining can overfit again and destabilize geometry that has already converged inside the blocks.
+
+Large-scene NeRF systems address scale through spatial decomposition or multiple local models \cite{turki2022meganerf,tancik2022blocknerf}. Large-scene Gaussian methods inherit this divide-and-conquer strategy while retaining explicit rendering. VastGaussian (VastGS) uses progressive partitioning and visibility-aware camera selection \cite{lin2024vastgaussian}; CityGaussian (CityGS) trains a coarse representation, decomposes the scene into blocks, and uses coarse render differences for camera assignment \cite{liu2024citygaussian}; Octree-GS provides a level-of-detail hierarchy for view-dependent rendering \cite{ren2024octreegs}; and Grendel scales optimization through distributed Gaussian and pixel parallelism \cite{zhao2025scaling3dgs}. These methods provide complementary partitioned, hierarchical, and distributed solutions. Our work focuses instead on adapting block complexity, selectively introducing depth supervision according to both prior reliability and geometric need, and coordinating a merged model without freely changing converged interior geometry.
+
+We propose \method, a block-wise reconstruction framework guided by a low-cost full-scene coarse Gaussian model. Its opacity--scale importance field determines recursive split decisions, while Gaussian projection provides coarse camera screening and render difference provides fine screening. During block optimization, aligned monocular depth is gated by cross-view prior confidence and rendered Gaussian depth uncertainty, so supervision concentrates on locations where the prior is reliable and the current geometry remains ambiguous. After core-owned block models are merged, a short global stage updates all Gaussian attributes inside boundary bands but only spherical-harmonic appearance and opacity in block interiors.
+
+The main contributions of this work are summarized as follows:
+\begin{enumerate}
+    \item We propose Importance-Guided Recursive Partitioning, which uses coarse Gaussian opacity and scale to adapt block granularity and combines projection-based coarse screening with render-difference fine screening for camera assignment.
+    \item We introduce Dual-Confidence Gated Depth Regularization, which combines cross-view monocular-depth consistency with Gaussian ray-depth uncertainty to focus geometric supervision on reliable yet under-constrained regions.
+    \item We develop Boundary-Constrained Attribute-Wise Global Fine-Tuning, which permits full-parameter updates near block boundaries while limiting interior optimization to appearance and opacity to reduce the risk of destabilizing converged geometry.
+\end{enumerate}
+
+\begin{figure*}[t]
+    \centering
+    \fbox{\parbox[c][3.55cm][c]{0.96\textwidth}{
+        \centering
+        \textbf{Teaser Placeholder}\\[2mm]
+        TODO: Large-scene input and camera trajectory $\rightarrow$ complete reconstruction $\rightarrow$ three enlarged local details.
+    }}
+    \caption{Teaser for large-scale reconstruction with \method. The final figure will show the calibrated large-scene input, the unified Gaussian reconstruction, and matched close-ups that reveal distant structure and local geometric detail. No synthetic result is inserted at the drafting stage.}
+    \label{fig:teaser}
+\end{figure*}
+
+\section{Related Work}
+
+\subsection{Novel View Synthesis}
+
+Early novel-view synthesis methods represented the plenoptic function through dense ray samples or used reconstructed geometry to warp and blend source images \cite{levoy1996light,gortler1996lumigraph}. Their quality depends strongly on capture density, proxy accuracy, and robust visibility reasoning. NeRF instead learns a continuous mapping from 3D position and viewing direction to density and radiance and renders views by integrating samples along camera rays \cite{mildenhall2020nerf}. This formulation handles view-dependent effects and imperfect geometry implicitly, but its original dense sampling makes training and rendering costly.
+
+Later neural fields improve efficiency by changing either sampling or representation. Mip-NeRF 360 introduces scene contraction and antialiased conical integration for unbounded scenes \cite{barron2022mipnerf360}. NSVF skips empty space using a sparse neural voxel structure \cite{liu2020nsvf}, KiloNeRF distributes capacity across many small networks \cite{reiser2021kilonerf}, and DVGO directly optimizes a voxel grid \cite{sun2022dvgo}. TensoRF factorizes a volumetric field into compact tensor components \cite{chen2022tensorf}; Plenoxels optimizes a sparse voxel grid without an MLP \cite{fridovichkeil2022plenoxels}; and Instant-NGP combines multiresolution hash encoding with compact networks \cite{muller2022instantngp}. These approaches progressively move computation from a large implicit network toward explicit, sparse, or factorized scene parameters.
+
+3DGS completes this shift with anisotropic Gaussians carrying opacity and spherical-harmonic appearance \cite{kerbl2023gaussiansplatting}. Differentiable tile-based rasterization yields fast rendering and supports adaptive densification during training. Follow-up work improves aliasing and scale behavior \cite{yu2024mipsplatting} or organizes scene-dependent Gaussian anchors \cite{lu2024scaffoldgs}. The explicit representation is convenient for editing, merging, and spatial selection, but its memory grows with the primitive count. Consequently, a scene that is much larger or more uneven than the object-scale benchmarks can exceed a practical device budget even though its final rasterization remains efficient.
+
+\subsection{Large-Scale Scene Reconstruction}
+
+Large-scale NeRF methods commonly divide a scene into spatially local models or progressively expand the represented scale. BungeeNeRF trains a sequence of residual blocks for extreme multiscale city rendering \cite{xiangli2022bungeenerf}. Mega-NeRF partitions camera rays and scene content into cells that can be optimized separately, and its Mill19 Building and Rubble scenes expose the scale and appearance variation of aerial captures \cite{turki2022meganerf}. Block-NeRF composes many local NeRFs for city-scale driving sequences and models appearance variation across captures \cite{tancik2022blocknerf}. Such systems demonstrate that divide-and-conquer training can fit large environments, although composition, overlap, and resource allocation become part of the reconstruction problem.
+
+The same principle has been adapted to explicit Gaussians. VastGS progressively partitions a scene, associates cameras and points using an airspace-aware visibility criterion, independently trains cells, and merges them for real-time rendering \cite{lin2024vastgaussian}. CityGS uses a coarse Gaussian scene to support block training and rendering-difference-based camera assignment, together with a scalable rendering representation \cite{liu2024citygaussian}. Our work shares their coarse-to-fine and block-wise motivation, but uses the coarse Gaussian attributes directly to choose whether, where, and along which axis a block is split.
+
+Hierarchical representations address another aspect of scale. Octree-GS organizes anchor-based Gaussians in a level-of-detail octree, selecting appropriate detail according to the view \cite{ren2024octreegs}. It is therefore complementary to a training decomposition whose main purpose is balancing representation load. Distributed systems instead expand the hardware budget. The system referred to as Grendel-GS distributes Gaussian parameters and pixels and studies scaling to very large primitive and image counts \cite{zhao2025scaling3dgs}. Because wall-clock time depends on GPU count, interconnect, per-device memory, image resolution, and batch construction, our experiments report distributed and single-device results with their complete hardware context rather than treating raw time as a hardware-independent measure.
+
+Datasets have also expanded from bounded captures to city-scale imagery. MatrixCity provides synthetic city-scale trajectories and renderings \cite{li2023matrixcity}, while UrbanScene3D contains real and synthetic large urban scenes for reconstruction and simulation \cite{lin2022urbanscene3d}. Together with Mill19, these datasets cover aerial and ground-level observations, variable visibility, and nonuniform structural complexity, which are central to the proposed evaluation.
+
+\section{Method}
+
+\subsection{Problem Formulation and Preliminaries}
+
+Given calibrated images $\mathcal{I}=\{(I_c,\mathbf{K}_c,\mathbf{T}_c)\}_{c=1}^{N}$, the goal is to optimize a Gaussian scene $\mathcal{G}$ that renders the observed images and supports novel views. A primitive $g_i$ contains center $\boldsymbol{\mu}_i\in\mathbb{R}^{3}$, scale $\mathbf{s}_i\in\mathbb{R}_{+}^{3}$, rotation $\mathbf{R}_i\in SO(3)$, opacity $\alpha_i\in(0,1)$, and spherical-harmonic coefficients $\mathbf{f}_i$. Its world-space covariance is
+\begin{equation}
+\boldsymbol{\Sigma}_i=\mathbf{R}_i\operatorname{diag}(\mathbf{s}_i^2)\mathbf{R}_i^{\mathsf T}.
+\label{eq:covariance}
+\end{equation}
+For camera $c$, the rasterizer projects $\boldsymbol{\mu}_i$ and approximates its screen-space covariance with the local projection Jacobian. After depth sorting, the color at pixel $p$ is
+\begin{equation}
+\hat{I}_c(p)=\sum_{i=1}^{M}T_i(p)\,a_i(p)\,\mathbf{c}_i(\mathbf{d}_c),\quad
+T_i(p)=\prod_{j<i}\left(1-a_j(p)\right),
+\label{eq:blend}
+\end{equation}
+where $a_i(p)$ combines learned opacity with the projected 2D Gaussian density and $\mathbf{c}_i(\mathbf{d}_c)$ is view-dependent color evaluated from the spherical harmonics along direction $\mathbf{d}_c$.
+
+The standard photometric objective uses an $L_1$ term and structural similarity \cite{wang2004ssim}:
+\begin{equation}
+\mathcal{L}_{\mathrm{photo}}=(1-\lambda_{\mathrm{s}})\|\hat{I}_c-I_c\|_1
++\lambda_{\mathrm{s}}\bigl(1-\operatorname{SSIM}(\hat{I}_c,I_c)\bigr).
+\label{eq:photo}
+\end{equation}
+
+\subsection{Overview}
+
+The pipeline has three stages. First, a low-cost full-scene Gaussian model $\mathcal{G}^{\mathrm{c}}$ estimates the spatial distribution of representation load. Its attributes guide recursive partitioning, and its projected contribution supports camera assignment. Second, each block is initialized from $\mathcal{G}^{\mathrm{c}}$ and optimized independently with photometric supervision and dual-confidence gated monocular depth. Each block exports only core-owned Gaussians. Third, the core subsets are concatenated and globally fine-tuned with attribute-wise constraints determined by whether a Gaussian lies inside a block-boundary band.
+
+\begin{figure*}[t]
+    \centering
+    \fbox{\parbox[c][4.2cm][c]{0.96\textwidth}{
+        \centering
+        \textbf{Method Overview Placeholder}\\[1mm]
+        TODO: Calibrated RGB images, camera poses, and sparse geometry $\rightarrow$ coarse full-scene 3DGS $\rightarrow$ importance-guided recursive blocks\\
+        $\rightarrow$ projection coarse screening and render-difference fine screening $\rightarrow$ block optimization with a dual-confidence depth gate\\
+        $\rightarrow$ core-only merge $\rightarrow$ boundary full-parameter and interior appearance-only fine-tuning $\rightarrow$ unified Gaussian scene.
+    }}
+    \caption{Overview of \method. Calibrated images, camera poses, and sparse geometry first produce a coarse Gaussian scene. Its opacity--scale importance guides recursive partitioning; Gaussian projection coarsely screens cameras before render-difference fine screening. Each block is initialized from the coarse scene and trained with RGB loss and dual-confidence gated monocular depth. Core-owned Gaussians are then merged. The final stage optimizes every attribute of boundary Gaussians while updating only spherical-harmonic appearance and opacity for interior Gaussians, yielding a unified scene.}
+    \label{fig:overview}
+\end{figure*}
+
+\subsection{Proposed Components}
+
+\subsubsection{Importance-Guided Recursive Partitioning}
+\paragraph{Coarse importance field}
+We first train $\mathcal{G}^{\mathrm{c}}=\{g_i\}_{i=1}^{M}$ for a reduced full-scene budget. It is used as a spatial load estimate rather than the final reconstruction. The implemented importance of Gaussian $i$ is
+\begin{equation}
+w_i=\alpha_i\bar{s}_i,\qquad
+\bar{s}_i=\frac{1}{3}\sum_{k=1}^{3}s_{i,k}.
+\label{eq:importance}
+\end{equation}
+Opacity reflects participation in image formation and mean scale approximates represented spatial extent. For scenes with large coordinate ranges, the centers can be mapped by the Mip-NeRF 360 contraction \cite{barron2022mipnerf360} using a configured axis-aligned bounding box. Partition operations then use contracted coordinates $\tilde{\boldsymbol{\mu}}_i$, whereas rendering and optimization remain in world coordinates.
+
+\paragraph{Recursive split selection}
+For node $B$ with coarse indices $\mathcal{J}_B$, its total importance is
+\begin{equation}
+W(B)=\sum_{i\in\mathcal{J}_B}w_i.
+\label{eq:blockimportance}
+\end{equation}
+If no absolute threshold is configured, the target leaf importance is the total scene importance divided by the requested maximum number of blocks. A node stops when it falls below the importance and optional density thresholds, or reaches the configured maximum depth, minimum point count, or spatial-size guard.
+
+For each permitted axis $a$, we compute weighted variance
+\begin{align}
+V_a(B)&=\frac{1}{W(B)}\sum_{i\in\mathcal{J}_B}w_i
+\left(\tilde{\mu}_{i,a}-\bar{\mu}_a\right)^2,\nonumber\\
+\bar{\mu}_a&=\frac{1}{W(B)}\sum_{i\in\mathcal{J}_B}w_i\tilde{\mu}_{i,a}.
+\label{eq:weightedvariance}
+\end{align}
+The axis with maximum $V_a$ is selected. Candidate positions are sampled from spatial quantiles rather than fixed at the box midpoint. For candidate $t$, the implementation evaluates
+\begin{align}
+E(t)&=E_{\mathrm{bal}}(t)+\lambda_{\mathrm{bnd}}E_{\mathrm{cut}}(t),\label{eq:splitenergy}\\
+E_{\mathrm{bal}}(t)&=\frac{|W(B_l(t))-W(B_r(t))|}{W(B)},\nonumber\\
+E_{\mathrm{cut}}(t)&=\frac{1}{W(B)}\sum_{i:\,|\tilde{\mu}_{i,a}-t|\leq\delta_B}w_i,\nonumber
+\end{align}
+where $B_l$ and $B_r$ are the two candidate children and $\delta_B$ is $2\%$ of the occupied coordinate range on the selected axis. Minimizing \eqref{eq:splitenergy} balances representation load and discourages cuts through locally important structure.
+
+\paragraph{Core ownership and camera assignment}
+Each leaf has a nonoverlapping core box $B^{\mathrm{core}}$ and an optionally expanded training box $B^{\mathrm{exp}}$. Expanded regions supply initialization or supervision context. At every save point, the implementation exports only Gaussians whose centers fall inside the core in partition coordinates:
+\begin{equation}
+\mathcal{G}^{\mathrm{save}}_B=\{g_i\in\mathcal{G}_B\mid
+\tilde{\boldsymbol{\mu}}_i\in B^{\mathrm{core}}\}.
+\label{eq:coreexport}
+\end{equation}
+This ownership rule makes the subsequent merge a direct concatenation without duplicate overlap primitives.
+
+Camera assignment follows a coarse-to-fine relevance test. We first project sampled coarse Gaussians from a block into each calibrated view and retain cameras with sufficient projected support. We then use the block's coarse render difference to fine-screen these candidates and keep views whose image contribution exceeds a configured threshold. If too few views remain, projected candidates are added according to inside-box status, coverage, and distance. Thus, cameras outside a block can still supervise structures that they observe, without evaluating fine render relevance for every image.
+
+\subsubsection{Dual-Confidence Gated Depth Regularization}
+
+\paragraph{Aligned monocular depth}
+For training view $i$, a pretrained monocular estimator \textbf{[CITATION TODO: monocular depth estimator]} produces depth $D_i^P$. Because monocular predictions have scale and shift ambiguity, we align them using sparse SfM observations or depth rendered by the coarse global model:
+\begin{equation}
+\widetilde D_i^P(p)=s_iD_i^P(p)+t_i,
+\label{eq:depthalign}
+\end{equation}
+where $s_i$ and $t_i$ are the per-view alignment scale and shift. The block model renders depth $\hat D_i$. Invalid alignment, reprojection, and visibility support is excluded by a binary mask introduced below.
+
+\paragraph{Prior confidence}
+Let $\mathcal{N}(i)$ denote neighboring views that co-observe the current region, and let $\widetilde D_{j\rightarrow i}^P$ be the aligned depth of neighbor $j$ reprojected into view $i$. We measure the relative cross-view disagreement at pixel $p$ by
+\begin{equation}
+e_i^P(p)=\operatorname{Med}_{j\in\mathcal{N}(i)}
+\frac{\left|\widetilde D_i^P(p)-\widetilde D_{j\rightarrow i}^P(p)\right|}
+{\widetilde D_i^P(p)+\epsilon}.
+\label{eq:priorerror}
+\end{equation}
+The monocular prior confidence is then
+\begin{equation}
+C_i^P(p)=\exp\left(-\frac{e_i^P(p)}{\tau_P}\right),
+\label{eq:priorconfidence}
+\end{equation}
+where $\tau_P>0$ controls sensitivity to cross-view inconsistency. Reprojection uses visibility and depth checks so that occluded or unsupported correspondences do not contribute.
+
+\paragraph{Gaussian geometry uncertainty}
+The depth prior should be emphasized not only when it is reliable, but also when the current Gaussian geometry remains uncertain. Let $d_k$ be the camera-space depth of the $k$th Gaussian contributing to pixel $p$, and let $\omega_k(p)$ be its alpha-compositing weight. We compute the ray-depth variance
+\begin{equation}
+V_i^G(p)=
+\frac{\sum_k\omega_k(p)\left(d_k-\hat D_i(p)\right)^2}
+{\sum_k\omega_k(p)+\epsilon},
+\label{eq:rayvariance}
+\end{equation}
+and map it to bounded uncertainty:
+\begin{equation}
+U_i^G(p)=1-\exp\left(-\frac{V_i^G(p)}{\tau_G}\right),
+\label{eq:geometryuncertainty}
+\end{equation}
+where $\tau_G>0$ sets the uncertainty scale. Large variance indicates that contributing Gaussians are dispersed along the ray, as can occur around thick surfaces, floating primitives, or geometrically ambiguous regions.
+
+\paragraph{Dual-confidence gate and loss}
+Let $M_i(p)\in\{0,1\}$ combine valid aligned depth, cross-view reprojection support, and visibility checks. The final detached supervision weight is
+\begin{equation}
+W_i(p)=\operatorname{sg}\!\left(M_i(p)C_i^P(p)U_i^G(p)\right),
+\label{eq:dualgate}
+\end{equation}
+where $\operatorname{sg}(\cdot)$ stops gradients through the gate. The multiplicative form gives high weight only when the prior is consistent across views and the current geometry is uncertain. We use a robust relative-depth objective
+\begin{equation}
+\mathcal{L}_{\mathrm{depth}}=
+\frac{\sum_pW_i(p)\rho\!\left(
+\dfrac{\hat D_i(p)-\widetilde D_i^P(p)}
+{\widetilde D_i^P(p)+\epsilon}\right)}
+{\sum_pW_i(p)+\epsilon},
+\label{eq:depthloss}
+\end{equation}
+where $\rho(\cdot)$ is a robust penalty; its exact form and hyperparameters will be specified with the final implementation. The block objective is
+\begin{equation}
+\mathcal{L}_{\mathrm{block}}=\mathcal{L}_{\mathrm{photo}}
++\lambda_d\mathcal{L}_{\mathrm{depth}}.
+\label{eq:blockloss}
+\end{equation}
+
+\subsubsection{Boundary-Constrained Attribute-Wise Global Fine-Tuning}
+
+Core-owned block models are concatenated in a fixed order,
+\begin{equation}
+\mathcal{G}^{\mathrm{merge}}=\bigcup_{B\in\mathcal{B}}\mathcal{G}^{\mathrm{save}}_B,
+\label{eq:merge}
+\end{equation}
+and the merge report records the contiguous Gaussian range originating from every block. For a source block $B$, Gaussian $i$ is marked as a boundary primitive along configured partition axis $a$ if
+\begin{equation}
+\min(\tilde{\mu}_{i,a}-B_a^{\min},B_a^{\max}-\tilde{\mu}_{i,a})
+\leq\beta(B_a^{\max}-B_a^{\min}),
+\label{eq:boundarymask}
+\end{equation}
+where $\beta$ is the relative band width. The union over selected axes gives boundary set $\mathcal{G}_{\mathrm{bnd}}$; all remaining primitives form $\mathcal{G}_{\mathrm{int}}$.
+
+The global stage applies an attribute-wise optimization policy. For every $g_i\in\mathcal{G}_{\mathrm{bnd}}$, position $\boldsymbol{\mu}_i$, scale $\mathbf{s}_i$, rotation $\mathbf{R}_i$, opacity $\alpha_i$, and spherical-harmonic coefficients $\mathbf{f}_i$ are all trainable. For every $g_i\in\mathcal{G}_{\mathrm{int}}$, geometry is frozen while opacity and appearance remain trainable:
+\begin{align}
+\nabla_{\boldsymbol{\mu}_i,\mathbf{s}_i,\mathbf{r}_i}\mathcal{L}_{\mathrm{global}}&=0,
+&&g_i\in\mathcal{G}_{\mathrm{int}},\label{eq:interiorfreeze}\\
+\{\alpha_i,\mathbf{f}_i\}&\ \text{remain trainable},
+&&g_i\in\mathcal{G}_{\mathrm{int}}.
+\label{eq:interiorappearance}
+\end{align}
+Here $\mathbf{r}_i$ denotes the optimized rotation parameterization of $\mathbf{R}_i$, and $\mathcal{L}_{\mathrm{global}}=\mathcal{L}_{\mathrm{photo}}$. This policy allows cross-block geometry and appearance to be coordinated near interfaces while preventing unconstrained global retraining from overfitting or destabilizing already converged interior geometry. Densification and pruning are disabled, so the source-block ranges and boundary mask remain fixed.
+
+\begin{figure}[t]
+    \centering
+    \fbox{\parbox[c][4.15cm][c]{0.91\columnwidth}{
+        \centering
+        \textbf{Partition--Train--Merge Placeholder}\\[1mm]
+        TODO: importance-guided recursive split; projection coarse screening and render-difference fine screening; dual-confidence depth gate; core-only export; boundary/interior attribute policy.
+    }}
+    \caption{Core mechanics of \method. The final illustration will contrast midpoint or fixed-grid partitioning with importance-guided recursive cuts, show projection-based camera screening followed by render-difference fine screening, visualize the product of prior confidence and Gaussian geometry uncertainty, and distinguish full-parameter boundary updates from appearance-and-opacity-only interior updates.}
+    \label{fig:mechanics}
+\end{figure}
+
+\subsection{Training Objective and Implementation}
+
+The complete process is coarse training, partition construction, independent block optimization, core-only export, concatenation, and attribute-wise global fine-tuning. Block jobs can run independently on distinct GPUs, while each individual trainer samples one camera per iteration. Coarse and block stages retain the standard 3DGS densification schedule, whereas global fine-tuning disables densification and pruning. Exact iteration counts, learning rates, block limits, image resolutions, neighboring-view selection, reprojection checks, robust penalty, confidence temperatures, depth weight, and boundary-band width will be fixed per dataset and reported with the released configurations. % TODO(implementation): implement and verify cross-view depth reprojection, ray-depth variance, and the final robust penalty before claiming experimental results.
+
+\section{Experiments}
+
+\subsection{Experimental Setup}
+
+\textbf{Datasets.} We plan experiments on MatrixCity-Aerial \cite{li2023matrixcity}, Mill19-Building and Mill19-Rubble \cite{turki2022meganerf}, and the Residence, Sci-Art, and Campus scenes of UrbanScene3D \cite{lin2022urbanscene3d}. These six scenes cover synthetic aerial imagery, real drone captures, and large urban environments. For each scene, we will report the number of training and test images, spatial extent, input resolution, and split protocol.
+
+\textbf{Baselines.} We compare with the original 3DGS \cite{kerbl2023gaussiansplatting}, VastGS \cite{lin2024vastgaussian}, CityGS \cite{liu2024citygaussian}, Octree-GS \cite{ren2024octreegs}, and Grendel-GS \cite{zhao2025scaling3dgs}. We will distinguish results reproduced under a matched hardware budget from results obtained with each method's native or official configuration. Multi-GPU wall-clock time will not be interpreted as directly equivalent to single-GPU time.
+
+\textbf{Metrics.} Image quality is measured using PSNR, SSIM \cite{wang2004ssim}, and LPIPS \cite{zhang2018lpips}. Resource evaluation reports end-to-end training time, peak allocated and reserved GPU memory where available, final Gaussian count, serialized model size, and rendering frames per second. We additionally record the per-block Gaussian count, assigned image count, training time, and peak memory to quantify load balance. Any metric not obtainable for a baseline will remain explicitly marked as unavailable or TODO rather than inferred.
+
+\textbf{Reproducibility TODOs.} GPU model and number: \TBD; memory per GPU: \TBD; CPU and system memory: \TBD; CUDA and PyTorch versions: \TBD; image resolution: \TBD; training iterations: \TBD; train/test split: \TBD; hyperparameters: \TBD; baseline reproduction protocol: \TBD; batch size for every method: \TBD. For Grendel-GS, the final paper will explicitly list GPU type, GPU count, memory per GPU, batch size, input resolution, iteration count, interconnect if relevant, and total training time.
+
+\subsection{Comparison with State-of-the-Art Methods}
+
+Table~\ref{tab:quality} reserves the main quality comparison. Every value is intentionally left as \TBD. Best and second-best formatting will be added only after the complete table is verified. Results will be grouped by matched hardware budget when feasible; native configurations will be reported separately if matching changes the intended operating regime.
+
+\begin{table*}[t]
+\caption{Novel-view synthesis quality on six large-scale scenes. No method is pre-marked as best. Higher is better for PSNR and SSIM; lower is better for LPIPS.}
+\label{tab:quality}
+\centering
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{llcccccc}
+\toprule
+Metric & Dataset & 3DGS & VastGS & CityGS & Octree-GS & Grendel-GS & Ours \\
+\midrule
+\multirow{6}{*}{PSNR $\uparrow$}
+& MatrixCity-Aerial & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& Mill19-Building & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& Mill19-Rubble & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Residence & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Sci-Art & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Campus & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+\midrule
+\multirow{6}{*}{SSIM $\uparrow$}
+& MatrixCity-Aerial & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& Mill19-Building & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& Mill19-Rubble & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Residence & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Sci-Art & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Campus & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+\midrule
+\multirow{6}{*}{LPIPS $\downarrow$}
+& MatrixCity-Aerial & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& Mill19-Building & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& Mill19-Rubble & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Residence & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Sci-Art & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+& US3D-Campus & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Fig.~\ref{fig:qualitative} reserves matched views and crops for the six-scene qualitative comparison. It is placed near the quantitative results so that visual evidence can be read together with the quality metrics.
+
+\begin{figure*}[t]
+    \centering
+    \fbox{\parbox[c][8.0cm][c]{0.96\textwidth}{
+        \centering
+        \textbf{Six-Dataset Qualitative Comparison Placeholder}\\[1mm]
+        TODO: Rows for MatrixCity-Aerial, Mill19-Building, Mill19-Rubble, Residence, Sci-Art, and Campus;\\
+        columns for reference, 3DGS, VastGS, CityGS, Octree-GS, Grendel-GS, and Ours; include matched zoom boxes.
+    }}
+    \caption{Planned qualitative comparison on the six evaluation scenes. Every method will use the same camera and crop coordinates. Enlargements will emphasize geometric boundaries, distant detail, floating artifacts, and transitions near reconstructed block boundaries. Missing official outputs will be labeled rather than replaced by incomparable images.}
+    \label{fig:qualitative}
+\end{figure*}
+
+\subsection{Efficiency and Scalability Analysis}
+
+Table~\ref{tab:efficiency} records the variables needed to interpret resource cost. End-to-end time includes all method-required stages, including coarse training, partitioning, block training, merging, and global refinement for our method. We will also break down these stages in the supplementary material or final main paper if space permits. Peak memory is reported per GPU and together with the number of GPUs; model size and Gaussian count refer to the final representation used for evaluation.
+
+\begin{table*}[t]
+\caption{Training and resource comparison. Hardware context is part of each result. Native-config and matched-budget measurements will be separated in the completed table.}
+\label{tab:efficiency}
+\centering
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lcccccccc}
+\toprule
+Method & GPU & \#GPU & Mem./GPU & Batch & Resolution & Time & Gaussians & FPS \\
+\midrule
+3DGS & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+VastGS & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+CityGS & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+Octree-GS & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+Grendel-GS & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+Ours & \TBD & \TBD & \TBD & 1/block & \TBD & \TBD & \TBD & \TBD \\
+\bottomrule
+\end{tabular}
+\\[1mm]
+\footnotesize TODO: add peak allocated/reserved memory and serialized model size, either as columns or a second panel after actual ranges are known.
+\end{table*}
+
+To isolate scale, we will vary the target block count while preserving the image set and common optimization budget. Table~\ref{tab:scaling} reports reconstruction quality together with the maximum and coefficient of variation of per-block Gaussian count, time, and memory. Fig.~\ref{fig:scaling} will plot these quantities against scene size and block count.
+
+\begin{table}[t]
+\caption{Scalability and load balance on a representative large scene.}
+\label{tab:scaling}
+\centering
+\setlength{\tabcolsep}{2.7pt}
+\begin{tabular}{ccccc}
+\toprule
+Blocks & PSNR & Total time & Peak mem. & Load CV \\
+\midrule
+4 & \TBD & \TBD & \TBD & \TBD \\
+8 & \TBD & \TBD & \TBD & \TBD \\
+16 & \TBD & \TBD & \TBD & \TBD \\
+32 & \TBD & \TBD & \TBD & \TBD \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+    \centering
+    \fbox{\parbox[c][4.05cm][c]{0.91\columnwidth}{
+        \centering
+        \textbf{Scalability Curves Placeholder}\\[1mm]
+        TODO: scene size or block count versus end-to-end time, per-GPU peak memory, Gaussian count, and per-block load dispersion.
+    }}
+    \caption{Planned scalability analysis. Curves will distinguish total compute from wall-clock time and will include GPU count and per-device memory. Load dispersion will be measured from block-level Gaussian counts, training times, and peak memory rather than inferred from block area.}
+    \label{fig:scaling}
+\end{figure}
+
+\subsection{Ablation Study}
+
+The component ablation in Table~\ref{tab:ablation} follows the three proposed components cumulatively. The base system uses fixed block training and core-only merging. Subsequent rows add importance-guided recursive partitioning, dual-confidence gated depth regularization, and boundary-constrained attribute-wise global fine-tuning. We will report both quality and resource effects after every component and will not infer improvements before the experiments are complete.
+
+\begin{table}[t]
+\caption{Component ablation on a representative scene.}
+\label{tab:ablation}
+\centering
+\setlength{\tabcolsep}{1.7pt}
+\begin{tabular}{ccccccc}
+\toprule
+Partition & Dual gate & Boundary FT & PSNR & LPIPS & Time & Mem. \\
+\midrule
+-- & -- & -- & \TBD & \TBD & \TBD & \TBD \\
+$\checkmark$ & -- & -- & \TBD & \TBD & \TBD & \TBD \\
+$\checkmark$ & $\checkmark$ & -- & \TBD & \TBD & \TBD & \TBD \\
+$\checkmark$ & $\checkmark$ & $\checkmark$ & \TBD & \TBD & \TBD & \TBD \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We will further diagnose each component through: (i) opacity versus opacity--scale importance; (ii) midpoint versus weighted split selection; (iii) projection-only camera assignment versus projection plus render-difference screening; (iv) prior confidence only, Gaussian geometry uncertainty only, and their multiplicative dual gate; (v) no global fine-tuning, unconstrained global fine-tuning, and boundary-constrained attribute-wise fine-tuning; (vi) boundary-band width; and (vii) target block count. These tests will quantify effects on reconstruction quality, training time, peak memory, per-block load dispersion, and stability as scene scale increases.
+
+\subsection{Qualitative Analysis}
+
+Fig.~\ref{fig:qualitative} will show identical crops from all six datasets. The final discussion will focus on facade edges, roofs, thin structures, distant regions, floaters, and block boundaries. Claims will be tied to visible evidence and the corresponding ablations; no qualitative ranking is asserted in the current draft.
+
+\section{Conclusion}
+
+We presented \method, a large-scale 3D Gaussian Splatting framework organized around three coupled components. Coarse opacity--scale importance guides recursive partitioning, followed by projection-based coarse screening and render-difference fine screening of cameras. Dual-confidence gated depth regularization combines cross-view prior consistency with Gaussian ray-depth uncertainty during block training. After core-only merging, boundary-constrained attribute-wise global fine-tuning updates every attribute near block interfaces while limiting interior changes to appearance and opacity. The planned six-scene evaluation will quantify reconstruction quality, peak GPU memory, training time, load balance, and the behavior of each component without presuming the final ranking.
+
+% TODO(result): Add a concise, evidence-based final-result sentence after all tables and figures are complete.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
