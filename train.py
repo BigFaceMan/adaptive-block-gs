@@ -13,11 +13,24 @@ import os
 import math
 import torch
 import time
+
+
+def configure_cpu_threads_from_env():
+    cpu_threads = int(os.environ.get("BLOCKGS_CPU_THREADS", "0") or 0)
+    interop_threads = int(os.environ.get("BLOCKGS_INTEROP_THREADS", "0") or 0)
+    if cpu_threads > 0:
+        torch.set_num_threads(cpu_threads)
+    if interop_threads > 0:
+        torch.set_num_interop_threads(interop_threads)
+
+
+configure_cpu_threads_from_env()
+
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
-from scene.datasets import CameraDataLoader, GSCameraDataset
+from scene.datasets import CameraDataLoader, CUDACameraPrefetcher, GSCameraDataset
 from utils.block_depth_mask import BlockDepthMasker
 from utils.general_utils import safe_state, get_expon_lr_func
 from utils.pseudo_view import make_pseudo_view_camera, pseudo_view_reprojection_loss, warp_pseudo_normal_to_ref
@@ -30,6 +43,16 @@ from utils.config_utils import (
 import uuid
 from tqdm import tqdm
 from utils.image_utils import image_to_cuda_float, psnr
+from utils.training_checkpoint import (
+    find_latest_checkpoint,
+    load_checkpoint,
+    make_checkpoint_payload,
+    prune_checkpoints,
+    restore_exposure_state,
+    restore_rng_state,
+    save_checkpoint,
+)
+from utils.training_profiler import TrainingProfiler
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -507,24 +530,54 @@ def auto_cache_num_from_memory(dataset, train_dataset, current_cache_num, sample
     return target_num
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, logger):
+def update_scalar_ema_(ema, value, decay=0.6):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().to(device=ema.device, dtype=ema.dtype)
+    else:
+        value = ema.new_tensor(float(value))
+    ema.mul_(decay).add_(value, alpha=1.0 - decay)
+
+
+def training(
+    dataset,
+    opt,
+    pipe,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    debug_from,
+    logger,
+    auto_resume=False,
+    checkpoint_interval=0,
+    checkpoint_keep_last=0,
+):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    if checkpoint is None and auto_resume:
+        checkpoint = find_latest_checkpoint(dataset.model_path)
+        if checkpoint:
+            print(f"[Checkpoint] Auto-resuming from {checkpoint}")
+
     first_iter = 0
+    checkpoint_payload = None
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        checkpoint_payload = load_checkpoint(checkpoint)
+        first_iter = int(checkpoint_payload["iteration"])
+        gaussians.restore(checkpoint_payload["gaussians"], opt)
+        restore_exposure_state(gaussians, checkpoint_payload.get("exposure"))
+        print(
+            "[Checkpoint] "
+            f"loaded version={checkpoint_payload.get('version', 1)} iteration={first_iter}"
+        )
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
@@ -600,8 +653,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             cache_max_items=getattr(opt, "depth_reg_mask_cache_max_items", 0),
         )
 
-    max_cache_num = int(getattr(dataset, "max_cache_num", 0))
-    release_viewpoint_after_iter = max_cache_num == 0
+    resume_training_state = checkpoint_payload.get("training", {}) if checkpoint_payload else {}
+    max_cache_num = int(resume_training_state.get("max_cache_num", getattr(dataset, "max_cache_num", 0)))
+    prefetch_enabled = getattr(dataset, "image_prefetch_mode", "cuda") == "cuda"
+    release_viewpoint_after_iter = max_cache_num == 0 or prefetch_enabled
     train_dataset = GSCameraDataset(
         scene.getTrainCameraInfos(),
         dataset,
@@ -628,23 +683,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     camera_loader = build_camera_loader(max_cache_num)
-    camera_loader_iter = iter(camera_loader)
+    if checkpoint_payload and checkpoint_payload.get("camera_loader"):
+        camera_loader.load_state_dict(checkpoint_payload["camera_loader"])
+
+    def build_camera_iterator(loader):
+        return CUDACameraPrefetcher(
+            iter(loader),
+            enabled=prefetch_enabled,
+        )
+
+    camera_loader_iter = build_camera_iterator(camera_loader)
     auto_cache_enabled = bool(getattr(dataset, "auto_cache_after_densify", False))
-    auto_cache_done = False
-    ema_loss_for_log = 0.0
-    ema_Ll1depth_for_log = 0.0
-    ema_Lnormal_for_log = 0.0
-    ema_Lpseudo_for_log = 0.0
-    ema_Lpseudo_normal_for_log = 0.0
-    ema_time_render = 0.0
-    ema_time_loss = 0.0
-    ema_time_densify = 0.0
+    auto_cache_done = bool(resume_training_state.get("auto_cache_done", False))
+    ema_loss_for_log = torch.zeros((), dtype=torch.float32, device="cuda")
+    ema_Ll1depth_for_log = torch.zeros((), dtype=torch.float32, device="cuda")
+    ema_Lnormal_for_log = torch.zeros((), dtype=torch.float32, device="cuda")
+    ema_Lpseudo_for_log = torch.zeros((), dtype=torch.float32, device="cuda")
+    ema_Lpseudo_normal_for_log = torch.zeros((), dtype=torch.float32, device="cuda")
+    observation_interval = max(1, int(getattr(opt, "training_observation_interval", 100)))
+    last_mean_grad = 0.0
+    profiler = TrainingProfiler(
+        enabled=getattr(opt, "training_profiler_enabled", True),
+        interval=getattr(opt, "training_profiler_interval", 100),
+        warmup=getattr(opt, "training_profiler_warmup", 10),
+    )
+
+    if checkpoint_payload:
+        restore_rng_state(checkpoint_payload.get("rng"))
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     try:
         for iteration in range(first_iter, opt.iterations + 1):
-            iter_start.record()
+            iteration_phase_start = profiler.start_cuda_phase()
+            log_due = bool(logger) and iteration % 10 == 0
+            validation_due = iteration in testing_iterations
+            log_iter_start = None
+            log_iter_end = None
+            if log_due:
+                log_iter_start = torch.cuda.Event(enable_timing=True)
+                log_iter_end = torch.cuda.Event(enable_timing=True)
+                log_iter_start.record()
 
             gaussians.update_learning_rate(iteration)
 
@@ -653,11 +732,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.oneupSHdegree()
 
             # Pick a random Camera
+            data_wait_start = time.perf_counter()
             try:
                 viewpoint_cam = next(camera_loader_iter)
             except StopIteration:
-                camera_loader_iter = iter(camera_loader)
+                camera_loader_iter.close()
+                camera_loader_iter = build_camera_iterator(camera_loader)
                 viewpoint_cam = next(camera_loader_iter)
+            profiler.record_cpu("data_wait_cpu", time.perf_counter() - data_wait_start)
+            prefetch_stats = getattr(viewpoint_cam, "prefetch_stats", {})
+            profiler.record_cpu("camera_load_cpu", prefetch_stats.get("load_cpu_seconds", 0.0))
+            profiler.record_cpu("mask_prepare_cpu", prefetch_stats.get("prepare_cpu_seconds", 0.0))
+            profiler.record_cpu("pin_memory_cpu", prefetch_stats.get("pin_cpu_seconds", 0.0))
+            h2d_start, h2d_end = getattr(viewpoint_cam, "prefetch_h2d_events", (None, None))
+            profiler.record_cuda_events("h2d", h2d_start, h2d_end)
 
             # Render
             if (iteration - 1) == debug_from:
@@ -665,7 +753,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-            start = time.time()
             normal_active = iteration >= normal_start_iter
             if normal_active:
                 normal_weight_step = iteration if normal_start_iter <= 0 else iteration - normal_start_iter + 1
@@ -677,20 +764,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 and bool(getattr(viewpoint_cam, "normal_reliable", False))
                 and getattr(viewpoint_cam, "normalmap", None) is not None
             )
-            render_pkg = render(
-                viewpoint_cam,
-                gaussians,
-                pipe,
-                bg,
-                use_trained_exp=dataset.train_test_exp,
-                separate_sh=SPARSE_ADAM_AVAILABLE,
-                return_normal=render_normal,
-            )
+            with profiler.cuda_phase("render"):
+                render_pkg = render(
+                    viewpoint_cam,
+                    gaussians,
+                    pipe,
+                    bg,
+                    use_trained_exp=dataset.train_test_exp,
+                    separate_sh=SPARSE_ADAM_AVAILABLE,
+                    return_normal=render_normal,
+                )
             image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            end = time.time()
-            ema_time_render = 0.4 * (end - start) + 0.6 * ema_time_render
 
-            start = time.time()
+            loss_phase_start = profiler.start_cuda_phase()
             if viewpoint_cam.alpha_mask is not None:
                 alpha_mask = image_to_cuda_float(viewpoint_cam.alpha_mask)
                 image *= alpha_mask
@@ -838,8 +924,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if Lpseudo_pure is not None:
                         Lpseudo_tensor = pseudo_weight_value * Lpseudo_pure
                         loss += Lpseudo_tensor
-                        Lpseudo_pure_item = Lpseudo_pure.item()
-                        Lpseudo = Lpseudo_tensor.item()
+                        Lpseudo_pure_item = Lpseudo_pure.detach()
+                        Lpseudo = Lpseudo_tensor.detach()
                 pseudo_reg_time = time.time() - pseudo_start
             pseudo_stats = {
                 "enabled": pseudo_reg_enabled,
@@ -947,8 +1033,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             Lpseudo_normal_pure = (normal_error * pseudo_normal_mask).sum() / pseudo_normal_mask.sum().clamp_min(1.0)
                             Lpseudo_normal_tensor = pseudo_normal_weight_value * Lpseudo_normal_pure
                             loss += Lpseudo_normal_tensor
-                            Lpseudo_normal_pure_item = Lpseudo_normal_pure.item()
-                            Lpseudo_normal = Lpseudo_normal_tensor.item()
+                            Lpseudo_normal_pure_item = Lpseudo_normal_pure.detach()
+                            Lpseudo_normal = Lpseudo_normal_tensor.detach()
                 pseudo_normal_reg_time = time.time() - pseudo_normal_start
             pseudo_normal_stats = {
                 "enabled": pseudo_normal_reg_enabled,
@@ -1052,8 +1138,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     Lnormal_pure = (normal_error * normal_confidence).sum() / normal_confidence_denom.clamp_min(1.0)
                     Lnormal_tensor = normal_weight_value * Lnormal_pure
                     loss += Lnormal_tensor
-                    Lnormal_pure_item = Lnormal_pure.item()
-                    Lnormal = Lnormal_tensor.item()
+                    Lnormal_pure_item = Lnormal_pure.detach()
+                    Lnormal = Lnormal_tensor.detach()
                 normal_reg_time = time.time() - normal_reg_start
             normal_stats = {
                 "enabled": normal_reg_enabled,
@@ -1089,48 +1175,86 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             }
 
             loss.backward()
-            end = time.time()
-            ema_time_loss = 0.4 * (end - start) + 0.6 * ema_time_loss
-
-            iter_end.record()
+            profiler.stop_cuda_phase("loss_backward", loss_phase_start)
+            if log_due:
+                log_iter_end.record()
 
             with torch.no_grad():
                 # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-                ema_Lnormal_for_log = 0.4 * Lnormal + 0.6 * ema_Lnormal_for_log
-                ema_Lpseudo_for_log = 0.4 * Lpseudo + 0.6 * ema_Lpseudo_for_log
-                ema_Lpseudo_normal_for_log = 0.4 * Lpseudo_normal + 0.6 * ema_Lpseudo_normal_for_log
+                update_scalar_ema_(ema_loss_for_log, loss)
+                update_scalar_ema_(ema_Ll1depth_for_log, Ll1depth)
+                update_scalar_ema_(ema_Lnormal_for_log, Lnormal)
+                update_scalar_ema_(ema_Lpseudo_for_log, Lpseudo)
+                update_scalar_ema_(ema_Lpseudo_normal_for_log, Lpseudo_normal)
 
                 if iteration % 10 == 0:
+                    progress_values = torch.stack(
+                        (
+                            ema_loss_for_log,
+                            ema_Ll1depth_for_log,
+                            ema_Lnormal_for_log,
+                            ema_Lpseudo_for_log,
+                            ema_Lpseudo_normal_for_log,
+                        )
+                    ).tolist()
                     progress_bar.set_postfix({
-                        "Loss": f"{ema_loss_for_log:.{7}f}",
-                        "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}",
-                        "Normal Loss": f"{ema_Lnormal_for_log:.{7}f}",
-                        "Pseudo Loss": f"{ema_Lpseudo_for_log:.{7}f}",
-                        "Pseudo Normal": f"{ema_Lpseudo_normal_for_log:.{7}f}",
+                        "Loss": f"{progress_values[0]:.{7}f}",
+                        "Depth Loss": f"{progress_values[1]:.{7}f}",
+                        "Normal Loss": f"{progress_values[2]:.{7}f}",
+                        "Pseudo Loss": f"{progress_values[3]:.{7}f}",
+                        "Pseudo Normal": f"{progress_values[4]:.{7}f}",
                     })
                     progress_bar.update(10)
                 if iteration == opt.iterations:
                     progress_bar.close()
 
-                grads = gaussians.xyz_gradient_accum / gaussians.denom
-                grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
-                ema_time = {
-                    "render": ema_time_render,
-                    "loss": ema_time_loss,
-                    "densify": ema_time_densify,
-                    "num_points": radii.shape[0],
-                    "mean_grad": grads.mean().item() if grads.numel() > 0 else 0.0,
-                }
-
                 # Log and save
-                training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), radii, visibility_filter, dataset.train_test_exp, dataset, depth_stats, normal_stats, pseudo_stats, pseudo_normal_stats)
+                if log_due or validation_due:
+                    if (
+                        log_due
+                        and iteration % observation_interval == 0
+                        and gaussians.xyz_gradient_accum.numel() > 0
+                    ):
+                        grads = gaussians.xyz_gradient_accum / gaussians.denom
+                        grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
+                        last_mean_grad = grads.mean().item()
+                    latest_profile = profiler.latest_summary
+                    ema_time = {
+                        "render": latest_profile.get("render_ms", 0.0) / 1000.0,
+                        "loss": latest_profile.get("loss_backward_ms", 0.0) / 1000.0,
+                        "densify": latest_profile.get("densify_ms", 0.0) / 1000.0,
+                        "num_points": radii.shape[0],
+                        "mean_grad": last_mean_grad,
+                    }
+                    elapsed = log_iter_start.elapsed_time(log_iter_end) if log_due else 0.0
+                    training_report(
+                        logger,
+                        iteration,
+                        Ll1,
+                        loss,
+                        l1_loss,
+                        ema_time,
+                        elapsed,
+                        testing_iterations,
+                        scene,
+                        render,
+                        (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp),
+                        radii,
+                        visibility_filter,
+                        dataset.train_test_exp,
+                        dataset,
+                        depth_stats,
+                        normal_stats,
+                        pseudo_stats,
+                        pseudo_normal_stats,
+                        observation_interval,
+                    )
                 if (iteration in saving_iterations):
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
                     scene.save(iteration)
 
                 # Densification
+                densify_phase_start = profiler.start_cuda_phase()
                 if iteration < opt.densify_until_iter:
                     # Keep track of max radii in image-space for pruning
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -1143,10 +1267,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         allocated_before = torch.cuda.memory_allocated()
                         reserved_before = torch.cuda.memory_reserved()
                         try:
-                            start = time.time()
                             gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                            end = time.time()
-                            ema_time_densify = 0.4 * (end - start) + 0.6 * ema_time_densify
                         except RuntimeError as exc:
                             if "out of memory" in str(exc).lower():
                                 print(
@@ -1177,8 +1298,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians.reset_opacity()
+                profiler.stop_cuda_phase("densify", densify_phase_start)
 
                 # Optimizer step
+                optimizer_phase_start = profiler.start_cuda_phase()
                 if iteration < opt.iterations:
                     gaussians.exposure_optimizer.step()
                     gaussians.exposure_optimizer.zero_grad(set_to_none = True)
@@ -1189,6 +1312,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     else:
                         gaussians.optimizer.step()
                         gaussians.optimizer.zero_grad(set_to_none = True)
+                profiler.stop_cuda_phase("optimizer", optimizer_phase_start)
 
                 if (
                     auto_cache_enabled
@@ -1221,14 +1345,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         logger.add_scalar("data/auto_cache_num", target_cache_num, iteration)
                         logger.add_scalar("data/auto_cache_sample_mb", sample_bytes / 1024**2, iteration)
                     max_cache_num = target_cache_num
-                    release_viewpoint_after_iter = max_cache_num == 0
+                    release_viewpoint_after_iter = max_cache_num == 0 or prefetch_enabled
                     camera_loader = build_camera_loader(max_cache_num)
-                    camera_loader_iter = iter(camera_loader)
+                    camera_loader_iter = build_camera_iterator(camera_loader)
                     auto_cache_done = True
 
-                if (iteration in checkpoint_iterations):
+                profiler.stop_cuda_phase("iteration_gpu", iteration_phase_start)
+                profiler.finish_iteration(iteration, logger=logger)
+
+                checkpoint_due = iteration in checkpoint_iterations or (
+                    int(checkpoint_interval) > 0
+                    and iteration < opt.iterations
+                    and iteration % int(checkpoint_interval) == 0
+                )
+                if checkpoint_due:
                     print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                    checkpoint_path = os.path.join(scene.model_path, f"chkpnt{iteration}.pth")
+                    payload = make_checkpoint_payload(
+                        iteration,
+                        gaussians,
+                        camera_loader_iter.state_dict(),
+                        training_state={
+                            "max_cache_num": max_cache_num,
+                            "auto_cache_done": auto_cache_done,
+                        },
+                    )
+                    save_checkpoint(checkpoint_path, payload)
+                    prune_checkpoints(scene.model_path, checkpoint_keep_last)
                 if release_viewpoint_after_iter and viewpoint_cam is not None:
                     viewpoint_cam.release_image()
     finally:
@@ -1303,7 +1446,7 @@ def log_training_observations(logger, iteration, gaussians, radii, visibility_fi
         group_name = group.get("name", "unknown")
         logger.add_scalar(f"optimizer/lr_{group_name}", group["lr"], iteration)
 
-def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None, normal_stats=None, pseudo_stats=None, pseudo_normal_stats=None):
+def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, radii, visibility_filter, train_test_exp, dataset_args=None, depth_stats=None, normal_stats=None, pseudo_stats=None, pseudo_normal_stats=None, observation_interval=100):
     if logger and iteration % 10 == 0:
         logger.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         logger.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -1393,7 +1536,8 @@ def training_report(logger, iteration, Ll1, loss, l1_loss, ema_time, elapsed, te
         logger.add_scalar('train_time/num_points', ema_time["num_points"], iteration)
         logger.add_scalar('train_time/mean_grad', ema_time["mean_grad"], iteration)
         logger.add_scalar('iter_time', elapsed, iteration)
-        log_training_observations(logger, iteration, scene.gaussians, radii, visibility_filter)
+        if iteration % max(1, int(observation_interval)) == 0:
+            log_training_observations(logger, iteration, scene.gaussians, radii, visibility_filter)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -1472,6 +1616,9 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--auto_resume", action="store_true", default=False)
+    parser.add_argument("--checkpoint_interval", type=int, default=0)
+    parser.add_argument("--checkpoint_keep_last", type=int, default=0)
     cli_args = parser.parse_args(sys.argv[1:])
     args = cli_args
     if cli_args.config:
@@ -1491,7 +1638,20 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, logger)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+        logger,
+        auto_resume=args.auto_resume,
+        checkpoint_interval=args.checkpoint_interval,
+        checkpoint_keep_last=args.checkpoint_keep_last,
+    )
 
     # All done
     print("\nTraining complete.")

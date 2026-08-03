@@ -65,6 +65,7 @@ class ModelParams(ParamGroup):
         self.image_load_mode = "dataloader"
         self.image_mmap_cache_dir = ""
         self.image_loader_seed = 42
+        self.image_prefetch_mode = "cuda"
         self.max_cache_num = 128
         self.image_cache_workers = 0
         self.auto_cache_after_densify = False
@@ -92,6 +93,10 @@ class ModelParams(ParamGroup):
         if image_load_mode not in {"dataloader", "cache", "shared_mmap"}:
             raise ValueError("--image_load_mode must be one of: dataloader, cache, shared_mmap")
         g.image_load_mode = image_load_mode
+        image_prefetch_mode = str(getattr(g, "image_prefetch_mode", "cuda") or "none").strip().lower()
+        if image_prefetch_mode not in {"none", "cuda"}:
+            raise ValueError("--image_prefetch_mode must be one of: none, cuda")
+        g.image_prefetch_mode = image_prefetch_mode
         if getattr(g, "image_mmap_cache_dir", ""):
             g.image_mmap_cache_dir = os.path.abspath(g.image_mmap_cache_dir)
         return g
@@ -180,6 +185,10 @@ class OptimizationParams(ParamGroup):
         self.pseudo_normal_detach_ref_depth = True
         self.random_background = False
         self.optimizer_type = "default"
+        self.training_profiler_enabled = True
+        self.training_profiler_interval = 100
+        self.training_profiler_warmup = 10
+        self.training_observation_interval = 100
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

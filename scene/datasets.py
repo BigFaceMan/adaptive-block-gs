@@ -1,6 +1,9 @@
+import copy
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import os
+import time
 
 import cv2
 import numpy as np
@@ -81,6 +84,7 @@ class GSCameraSample:
         self.normalmap = None
         self.normal_mask = None
         self.normal_reliable = False
+        self._prefetch_cpu_refs = None
 
 
 def _read_invdepth(depth_path, is_nerf_synthetic):
@@ -282,6 +286,16 @@ class GSCameraDataset(Dataset):
             self.image_cache = SharedMmapImageCache(cache_dir)
             self.image_cache.validate_args(args)
             print(f"[DataLoader] using shared mmap image cache: {cache_dir}")
+            missing_count = sum(
+                not self.image_cache.contains(cam_info.image_name)
+                for cam_info in self.camera_infos
+            )
+            if missing_count:
+                print(
+                    "[DataLoader] "
+                    f"{missing_count}/{len(self.camera_infos)} cameras are not in the shared mmap cache; "
+                    "loading those images from their dataset paths"
+                )
         if torch.cuda.is_available():
             torch.empty(0, device="cuda")
 
@@ -289,15 +303,94 @@ class GSCameraDataset(Dataset):
         return len(self.camera_infos)
 
     def __getitem__(self, idx):
+        cam_info = self.camera_infos[idx]
+        image_cache = self.image_cache
+        if image_cache is not None and not image_cache.contains(cam_info.image_name):
+            image_cache = None
         return load_camera_sample(
             self.args,
             idx,
-            self.camera_infos[idx],
+            cam_info,
             self.scale,
             self.is_nerf_synthetic,
             self.is_test_dataset,
-            self.image_cache,
+            image_cache,
         )
+
+
+class _CameraDataLoaderIterator:
+    def __init__(self, loader, state=None):
+        self.loader = loader
+        if state:
+            self.order = [int(idx) for idx in state["order"]]
+            self.cursor = int(state.get("cursor", 0))
+            generator_state = state.get("generator_state")
+            if generator_state is not None:
+                self.loader.generator.set_state(generator_state.cpu())
+        else:
+            self.order = self.loader._epoch_indices()
+            self.cursor = 0
+        self._chunk = None
+        self._chunk_start = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.cursor >= len(self.order):
+            self.close()
+            raise StopIteration
+
+        if self.loader.max_cache_num < 0:
+            dataset_index = self.order[self.cursor]
+            sample = self.loader.cached[dataset_index]
+        elif self.loader.max_cache_num == 0:
+            dataset_index = self.order[self.cursor]
+            sample = self.loader.dataset[dataset_index]
+        else:
+            if self._chunk is None or not (
+                self._chunk_start <= self.cursor < self._chunk_start + len(self._chunk)
+            ):
+                self._load_chunk()
+            dataset_index = self.order[self.cursor]
+            sample = self._chunk[self.cursor - self._chunk_start]
+
+        self.cursor += 1
+        sample.dataset_index = dataset_index
+        return sample
+
+    def _load_chunk(self):
+        self.loader._release_cached(self._chunk)
+        self._chunk = None
+        cache_count = min(self.loader.max_cache_num, len(self.order) - self.cursor)
+        while True:
+            indices = self.order[self.cursor:self.cursor + cache_count]
+            try:
+                self._chunk = self.loader._load_data(indices)
+                self._chunk_start = self.cursor
+                return
+            except RuntimeError as exc:
+                if not self.loader._is_cuda_oom(exc) or cache_count <= 1:
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                cache_count = max(1, cache_count // 2)
+                self.loader.max_cache_num = min(self.loader.max_cache_num, cache_count)
+                print(
+                    "[DataLoader] OOM while caching cameras; "
+                    f"retrying with max_cache_num={self.loader.max_cache_num}"
+                )
+
+    def state_dict(self, cursor=None):
+        return {
+            "order": list(self.order),
+            "cursor": self.cursor if cursor is None else int(cursor),
+            "generator_state": self.loader.generator.get_state(),
+        }
+
+    def close(self):
+        self.loader._release_cached(self._chunk)
+        self._chunk = None
 
 
 class CameraDataLoader(DataLoader):
@@ -312,7 +405,7 @@ class CameraDataLoader(DataLoader):
         self.generator = torch.Generator()
         self.generator.manual_seed(seed)
         self.cached = None
-        self._active_cache = None
+        self._resume_state = None
 
         if self.max_cache_num >= len(self.indices) and len(self.indices) > 0:
             self.max_cache_num = -1
@@ -372,50 +465,217 @@ class CameraDataLoader(DataLoader):
         if empty_cuda_cache and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def state_dict(self):
+        return {
+            "order": [],
+            "cursor": 0,
+            "generator_state": self.generator.get_state(),
+        }
+
+    def load_state_dict(self, state):
+        self._resume_state = state
+
     def close(self):
-        self._release_cached(self._active_cache, empty_cuda_cache=True)
-        self._active_cache = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def __iter__(self):
-        if self.max_cache_num < 0:
-            indices = self._epoch_indices()
-            for idx in indices:
-                yield self.cached[idx]
-            return
+        state = self._resume_state
+        self._resume_state = None
+        return _CameraDataLoaderIterator(self, state=state)
 
-        indices = self._epoch_indices()
-        if self.max_cache_num == 0:
-            for idx in indices:
-                yield self.dataset[idx]
-            return
 
-        not_cached = indices.copy()
-        while not_cached:
-            cache_count = min(self.max_cache_num, len(not_cached))
-            while True:
-                to_cache = not_cached[:cache_count]
-                try:
-                    cached = self._load_data(to_cache)
-                    break
-                except RuntimeError as exc:
-                    if not self._is_cuda_oom(exc) or cache_count <= 1:
-                        raise
-                    self._release_cached(self._active_cache, empty_cuda_cache=True)
-                    self._active_cache = None
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    cache_count = max(1, cache_count // 2)
-                    self.max_cache_num = min(self.max_cache_num, cache_count)
-                    print(
-                        "[DataLoader] OOM while caching cameras; "
-                        f"retrying with max_cache_num={self.max_cache_num}"
-                    )
-            del not_cached[:cache_count]
-            self._active_cache = cached
-            try:
-                for camera in cached:
-                    yield camera
-            finally:
-                self._release_cached(cached)
-                if self._active_cache is cached:
-                    self._active_cache = None
+_IMAGE_TENSOR_ATTRIBUTES = (
+    "original_image",
+    "alpha_mask",
+    "invdepthmap",
+    "depth_mask",
+    "normalmap",
+    "normal_mask",
+)
+
+
+def _pin_camera_sample(viewpoint_cam):
+    pinned = copy.copy(viewpoint_cam)
+    for attr in _IMAGE_TENSOR_ATTRIBUTES:
+        value = getattr(viewpoint_cam, attr, None)
+        if isinstance(value, torch.Tensor) and not value.is_cuda and not value.is_pinned():
+            value = value.pin_memory()
+        setattr(pinned, attr, value)
+    return pinned
+
+
+def _cuda_image_tensor(value, normalize_uint8=False):
+    if value is None or not isinstance(value, torch.Tensor):
+        return value
+    if normalize_uint8 and value.dtype == torch.uint8:
+        return value.to(device="cuda", dtype=torch.float32, non_blocking=True).div_(255.0)
+    return value.to(device="cuda", non_blocking=True)
+
+
+def _camera_sample_to_cuda(viewpoint_cam, stream):
+    cuda_sample = copy.copy(viewpoint_cam)
+    cpu_refs = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    with torch.cuda.stream(stream):
+        start.record(stream)
+        for attr in _IMAGE_TENSOR_ATTRIBUTES:
+            value = getattr(viewpoint_cam, attr, None)
+            if isinstance(value, torch.Tensor) and not value.is_cuda:
+                cpu_refs.append(value)
+            cuda_value = _cuda_image_tensor(
+                value,
+                normalize_uint8=attr in {"original_image", "alpha_mask"},
+            )
+            setattr(cuda_sample, attr, cuda_value)
+        end.record(stream)
+    cuda_sample._prefetch_cpu_refs = cpu_refs
+    return cuda_sample, start, end, cpu_refs
+
+
+class CUDACameraPrefetcher:
+    """One-camera-ahead pinned-memory/H2D pipeline with a bounded GPU queue."""
+
+    def __init__(self, camera_iterator, enabled=True, prepare_cpu=None):
+        self.camera_iterator = camera_iterator
+        self.enabled = bool(enabled) and torch.cuda.is_available()
+        self.prepare_cpu = prepare_cpu
+        self.logical_cursor = int(getattr(camera_iterator, "cursor", 0))
+        self.last_data_wait_seconds = 0.0
+        self._ready = deque()
+        self._inflight_sources = deque()
+        self._first_yield = True
+        self._exhausted = False
+        self._future = None
+        self._executor = None
+        self._stream = torch.cuda.Stream() if self.enabled else None
+
+        loader = getattr(camera_iterator, "loader", None)
+        if self.enabled and loader is not None and loader.cached is not None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+
+        if self.enabled:
+            self._submit_cpu()
+            self._append_ready()
+            self._append_ready()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        wait_start = time.perf_counter()
+        if not self.enabled:
+            sample = next(self.camera_iterator)
+            if self.prepare_cpu is not None:
+                sample = self.prepare_cpu(sample)
+            self.logical_cursor += 1
+            self.last_data_wait_seconds = time.perf_counter() - wait_start
+            sample.prefetch_stats = {
+                "load_cpu_seconds": self.last_data_wait_seconds,
+                "prepare_cpu_seconds": float(getattr(sample, "depth_mask_prepare_time", 0.0)),
+                "pin_cpu_seconds": 0.0,
+            }
+            sample.prefetch_h2d_events = (None, None)
+            return sample
+
+        if not self._first_yield:
+            self._append_ready()
+        self._first_yield = False
+        if not self._ready:
+            self.last_data_wait_seconds = time.perf_counter() - wait_start
+            raise StopIteration
+
+        sample, start, end, stats = self._ready.popleft()
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(end)
+        for attr in _IMAGE_TENSOR_ATTRIBUTES:
+            value = getattr(sample, attr, None)
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                value.record_stream(current_stream)
+
+        self.logical_cursor += 1
+        self.last_data_wait_seconds = time.perf_counter() - wait_start
+        sample.prefetch_stats = stats
+        sample.prefetch_h2d_events = (start, end)
+        self._release_completed_sources()
+        return sample
+
+    def _prepare_next(self):
+        load_start = time.perf_counter()
+        sample = next(self.camera_iterator)
+        load_seconds = time.perf_counter() - load_start
+
+        prepare_start = time.perf_counter()
+        if self.prepare_cpu is not None:
+            sample = self.prepare_cpu(sample)
+        prepare_seconds = time.perf_counter() - prepare_start
+
+        pin_start = time.perf_counter()
+        sample = _pin_camera_sample(sample)
+        pin_seconds = time.perf_counter() - pin_start
+        return sample, {
+            "load_cpu_seconds": load_seconds,
+            "prepare_cpu_seconds": prepare_seconds,
+            "pin_cpu_seconds": pin_seconds,
+        }
+
+    def _submit_cpu(self):
+        if self._exhausted or self._future is not None:
+            return
+        if self._executor is None:
+            return
+        self._future = self._executor.submit(self._prepare_next)
+
+    def _take_prepared(self):
+        if self._exhausted:
+            raise StopIteration
+        try:
+            if self._executor is None:
+                return self._prepare_next()
+            if self._future is None:
+                self._submit_cpu()
+            result = self._future.result()
+            self._future = None
+            self._submit_cpu()
+            return result
+        except StopIteration:
+            self._future = None
+            self._exhausted = True
+            raise
+
+    def _append_ready(self):
+        if self._exhausted:
+            return
+        try:
+            sample, stats = self._take_prepared()
+        except StopIteration:
+            return
+        cuda_sample, start, end, cpu_refs = _camera_sample_to_cuda(sample, self._stream)
+        self._ready.append((cuda_sample, start, end, stats))
+        self._inflight_sources.append((end, cpu_refs))
+        self._release_completed_sources(force_if_full=True)
+
+    def _release_completed_sources(self, force_if_full=False):
+        while self._inflight_sources and self._inflight_sources[0][0].query():
+            self._inflight_sources.popleft()
+        if force_if_full and len(self._inflight_sources) > 4:
+            event, _ = self._inflight_sources.popleft()
+            event.synchronize()
+
+    def state_dict(self):
+        return self.camera_iterator.state_dict(cursor=self.logical_cursor)
+
+    def close(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        for sample, _, _, _ in self._ready:
+            sample.release_image()
+        self._ready.clear()
+        for event, _ in self._inflight_sources:
+            event.synchronize()
+        self._inflight_sources.clear()
+        close = getattr(self.camera_iterator, "close", None)
+        if close is not None:
+            close()

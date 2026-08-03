@@ -116,6 +116,9 @@ def train_args(cfg: ExperimentConfig, block_id=None):
             "save_iterations": cfg.block_training.save_iterations,
             "checkpoint_iterations": cfg.block_training.checkpoint_iterations,
             "start_checkpoint": cfg.block_training.start_checkpoint,
+            "auto_resume": cfg.block_training.auto_resume,
+            "checkpoint_interval": cfg.block_training.checkpoint_interval,
+            "checkpoint_keep_last": cfg.block_training.checkpoint_keep_last,
         }
     )
     resolved_block_id = block_id or cfg.block_training.block_id

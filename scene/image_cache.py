@@ -59,6 +59,9 @@ class SharedMmapImageCache:
                 f"cache={expected_resolution}, args={args.resolution}"
             )
 
+    def contains(self, image_name):
+        return image_name in self.items or image_name in self._aliases
+
     def _item(self, image_name):
         key = image_name if image_name in self.items else self._aliases.get(image_name)
         if key is None:

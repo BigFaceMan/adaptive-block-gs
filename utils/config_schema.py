@@ -86,6 +86,7 @@ def get_default_dataset_params():
         image_load_mode="dataloader",
         image_mmap_cache_dir="",
         image_loader_seed=42,
+        image_prefetch_mode="cuda",
         max_cache_num=128,
         image_cache_workers=0,
         auto_cache_after_densify=False,
@@ -202,6 +203,10 @@ def get_default_optimization_params():
         pseudo_normal_detach_ref_depth=True,
         random_background=False,
         optimizer_type="default",
+        training_profiler_enabled=True,
+        training_profiler_interval=100,
+        training_profiler_warmup=10,
+        training_observation_interval=100,
     )
 
 
@@ -280,6 +285,9 @@ def get_default_block_training_params():
         save_iterations=[7000, 30000],
         checkpoint_iterations=[],
         start_checkpoint=None,
+        auto_resume=False,
+        checkpoint_interval=0,
+        checkpoint_keep_last=0,
     )
 
 

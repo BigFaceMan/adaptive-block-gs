@@ -29,6 +29,7 @@ from utils.config_utils import (
     stage_args_from_config,
 )
 from utils.general_utils import get_expon_lr_func, safe_state
+from utils.image_utils import image_to_cuda_float
 from utils.loss_utils import l1_loss, ssim
 from utils.partition_utils import all_camera_infos, mark_camera_infos_as_test
 from utils.post_train_utils import build_boundary_mask, input_ply_path, save_boundary_report
@@ -329,9 +330,9 @@ def training(dataset, opt, pipe, args, logger):
 
             start = time.time()
             if viewpoint_cam.alpha_mask is not None:
-                image *= viewpoint_cam.alpha_mask.cuda()
+                image *= image_to_cuda_float(viewpoint_cam.alpha_mask)
 
-            gt_image = viewpoint_cam.original_image.cuda()
+            gt_image = image_to_cuda_float(viewpoint_cam.original_image)
             Ll1 = l1_loss(image, gt_image)
             if FUSED_SSIM_AVAILABLE:
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
